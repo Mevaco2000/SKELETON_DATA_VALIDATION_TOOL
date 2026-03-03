@@ -1,0 +1,97 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "utils-yolo-validation"
+version = "0.1.0"
+description = "Professional toolkit for YOLO pose dataset validation, analysis, and manipulation"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "Proprietary"}
+authors = [
+    {name = "Data Validation Team"}
+]
+keywords = ["yolo", "pose-estimation", "computer-vision", "dataset-validation", "clip-embeddings", "duplicates"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+dependencies = [
+    "torch>=1.9.0",
+    "numpy>=1.19.0",
+    "pillow>=8.0.0",
+    "opencv-python>=4.5.0",
+    "matplotlib>=3.3.0",
+    "open-clip-torch>=2.0.0",
+    "faiss-cpu>=1.7.0",
+    "tqdm>=4.50.0",
+    "openpyxl>=3.0.0",
+    "ultralytics>=8.0.0",
+    "scikit-learn>=1.0.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "faiss-gpu>=1.7.0",
+]
+dev = [
+    "pytest>=6.0.0",
+    "pytest-cov>=2.10.0",
+    "mypy>=0.910",
+    "black>=21.0",
+    "flake8>=3.9.0",
+    "isort>=5.0.0",
+]
+api = [
+    "fastapi>=0.95.0",
+    "uvicorn[standard]>=0.21.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/example/utils-yolo-validation"
+Documentation = "https://github.com/example/utils-yolo-validation/blob/main/README.md"
+Repository = "https://github.com/example/utils-yolo-validation"
+
+[tool.setuptools]
+packages = ["utils", "utils.validation", "utils.datasets"]
+
+[tool.setuptools.package-data]
+utils = ["config.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--cov=utils --cov-report=html"
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+disallow_untyped_defs = false
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_mode = 3
+include_trailing_comma = true
+
+[tool.flake8]
+max-line-length = 100
+ignore = ["E203", "E266", "E501", "W503"]
+exclude = [".git", "__pycache__", "build", "dist", ".egg"]
