@@ -850,7 +850,7 @@ class YOLOPoseDataset:
             Tuple of (decimals, keypoints_per_image, image_paths):
             - decimals: Array (total_keypoints,) of uint64
             - keypoints_per_image: List of keypoint counts per image
-            - image_paths: List of image paths
+            - image_paths: List of image paths XDDDDDD
         """
         decimal_list = []
         paths = []
