@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "Proprietary"}
 authors = [
-    {name = "Data Validation Team"}
+    {name = "Rafał Wysocki, PUT"}
 ]
 keywords = ["yolo", "pose-estimation", "computer-vision", "dataset-validation", "clip-embeddings", "duplicates"]
 classifiers = [
