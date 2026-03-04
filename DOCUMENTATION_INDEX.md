@@ -6,17 +6,13 @@ Complete reference for all documentation files in the project.
 
 ## 📚 Documentation Files
 
-| File | Purpose | Read Time | Audience |
+| File | Purpose | Read Time | Best For |
 |------|---------|-----------|----------|
-| **README.md** | Full API reference & comprehensive guide | 10 min | Developers, Data Scientists |
-| **QUICK_START.md** | 5-minute setup & common tasks with examples | 5 min | New users, Quick reference |
-| **API_CHEATSHEET.md** | Quick function reference & patterns | 3 min | Speed lookup, troubleshooting |
-| **PROJECT_STRUCTURE.md** | Package organization & architecture | 8 min | Maintainers, Contributors |
-| **CHANGELOG.md** | Version history & roadmap | 5 min | Release notes, planning |
-| **pyproject.toml** | Python packaging metadata | - | Package managers |
-| **setup.py** | Legacy Python setup | - | pip compatibility |
-| **requirements.txt** | Pip dependencies | - | Virtual environment setup |
-| **.gitignore** | Git ignore patterns | - | Version control |
+| **README.md** | Comprehensive API reference | 15 min | Full documentation, all features |
+| **QUICK_START.md** | 5-minute setup & common tasks | 5 min | Getting started, copying examples |
+| **API_CHEATSHEET.md** | Quick function lookup | 3 min | Fast reference, copy-paste |
+| **PROJECT_STRUCTURE.md** | Architecture & organization | 8 min | Understanding code structure |
+| **CHANGELOG.md** | Version history & features | 5 min | Release notes, what's new |
 
 ---
 
@@ -27,44 +23,32 @@ Complete reference for all documentation files in the project.
 #### **Get started quickly**
 → Read [QUICK_START.md](QUICK_START.md) (5 min)
 ```python
-from utils import load_keypoints, train_yolo_pose_model
+from utils.datasets import YOLOPoseDataset
+from utils.validation import YPImageValidation
 ```
 
-#### **Look up a function**
+#### **Look up a function or class**
 → Check [API_CHEATSHEET.md](API_CHEATSHEET.md) (3 min)
-```python
-# Jump to function signatures and examples
-```
+- All class signatures with examples
+- Quick copy-paste code
 
 #### **Learn the full API**
-→ Read [README.md](README.md) (10 min)
-- Complete function documentation
-- Usage examples
+→ Read [README.md](README.md) (15 min)
+- Complete documentation
+- Detailed examples
 - Configuration options
-- Troubleshooting
 
-#### **Understand the project structure**
+#### **Understand the structure**
 → Read [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) (8 min)
 - Module organization
-- Design principles
-- Import patterns
-- Data flow diagrams
+- File layout
+- Design patterns
 
 #### **See what's new**
-→ Check [CHANGELOG.md](CHANGELOG.md)
+→ Check [CHANGELOG.md](CHANGELOG.md) (5 min)
 - Version history
 - New features
-- Known limitations
-- Roadmap
-
-#### **Install dependencies**
-→ Use [requirements.txt](requirements.txt)
-```bash
-pip install -r requirements.txt
-```
-
-#### **Extend the package**
-→ Read [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) → "Future Extensibility" section
+- What changed
 
 ---
 
@@ -72,31 +56,125 @@ pip install -r requirements.txt
 
 ### 👨‍💻 Developer (First Time)
 1. [QUICK_START.md](QUICK_START.md) — Get it working (5 min)
-2. [API_CHEATSHEET.md](API_CHEATSHEET.md) — Learn the functions (3 min)
-3. [README.md](README.md) — Deep dive (10 min)
-4. [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) — Understand architecture (8 min)
+2. [API_CHEATSHEET.md](API_CHEATSHEET.md) — Learn the API (3 min)
+3. [README.md](README.md) — Deep dive (15 min)
 
-**Total: ~26 minutes**
-
-### 🔧 Maintainer / Contributor
-1. [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) — Architecture overview (8 min)
-2. [README.md](README.md) — Full API documentation (10 min)
-3. [CHANGELOG.md](CHANGELOG.md) — Planned features (5 min)
-4. Code review in `utils/` package
-
-**Total: ~23 minutes + code review**
+**Total: ~23 minutes**
 
 ### 📊 Data Scientist / Analyst
-1. [QUICK_START.md](QUICK_START.md) — Setup and common tasks (5 min)
-2. [README.md](README.md) — Full API with examples (10 min)
-3. [API_CHEATSHEET.md](API_CHEATSHEET.md) — Quick reference bookmark
+1. [QUICK_START.md](QUICK_START.md) — Setup & examples (5 min)
+2. [API_CHEATSHEET.md](API_CHEATSHEET.md) — Bookmark for reference (3 min)
+3. [README.md](README.md) — Detailed examples (15 min)
 
-**Total: ~15 minutes + bookmarks**
+**Total: ~23 minutes + keep API_CHEATSHEET bookmarked**
 
-### ⚡ Power User (Knows Python)
-1. [API_CHEATSHEET.md](API_CHEATSHEET.md) — skim signatures (1 min)
-2. `help(function_name)` in Python (as needed)
-3. [README.md](README.md) — Reference only (as needed)
+### 🔧 Maintainer / Contributor
+1. [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) — Architecture (8 min)
+2. [README.md](README.md) — Full API (15 min)
+3. [CHANGELOG.md](CHANGELOG.md) — Version history (5 min)
+
+**Total: ~28 minutes + code review**
+
+### ⚡ Power User (Familiar with Python)
+1. [API_CHEATSHEET.md](API_CHEATSHEET.md) — Skim signatures (1 min)
+2. `help(ClassName)` in Python — As needed
+3. [README.md](README.md) — Reference only
+
+---
+
+## 🔑 Key Concepts
+
+### Main Classes
+
+**YOLOPoseDataset** — Load YOLO datasets
+```python
+from utils.datasets import YOLOPoseDataset
+dataset = YOLOPoseDataset("data.yaml")
+```
+
+**YOLOPoseImage** — Single image with annotations
+```python
+from utils.datasets import YOLOPoseImage
+img = YOLOPoseImage("image.jpg", "image.txt")
+```
+
+**YPImageValidation** — Per-image LBP features
+```python
+from utils.validation import YPImageValidation
+validator = YPImageValidation(image, keypoints)
+```
+
+**YPSetValidation** — Dataset-level features
+```python
+from utils.validation import YPSetValidation
+validator = YPSetValidation.from_yolo_dataset(dataset)
+```
+
+### Main Operations
+
+**Dataset Operations**
+- `split_yolo_pose_dataset()` — Split train/validation
+- `merge_yolo_pose_datasets()` — Merge datasets
+- `flatten_cvat_yolo_pose()` — Convert CVAT format
+- `extract_image_subset()` — Extract images by range
+
+**Analysis Functions**
+- `generate_group_visualizations()` — Visualize groups
+- `save_groups_analysis()` — JSON report
+- `export_groups_analysis_to_excel()` — Excel report
+
+**Utilities**
+- `YPImageValidation.load_keypoints()` — Load from label file
+- `YPImageValidation.draw_keypoints_on_image()` — Draw on image
+
+---
+
+## 💡 Common Use Cases
+
+### Use Case 1: Load and analyze dataset
+```python
+from utils.datasets import YOLOPoseDataset
+from utils.validation import YPSetValidation
+
+dataset = YOLOPoseDataset("data.yaml")
+validator = YPSetValidation.from_yolo_dataset(dataset, patch_size=5)
+features = validator.get_all_lbp_histograms()
+```
+→ See: [QUICK_START.md - Task 3](QUICK_START.md), [API_CHEATSHEET.md](API_CHEATSHEET.md)
+
+### Use Case 2: Process single image
+```python
+from utils.datasets import YOLOPoseImage
+from utils.validation import YPImageValidation
+
+img = YOLOPoseImage("image.jpg", "image.txt")
+validator = YPImageValidation(img.image, img.keypoints)
+features = validator.compute_lbp_histograms(patch_size=5)
+```
+→ See: [QUICK_START.md - Task 2](QUICK_START.md), [API_CHEATSHEET.md](API_CHEATSHEET.md)
+
+### Use Case 3: Dataset operations
+```python
+from utils.datasets import split_yolo_pose_dataset
+split_yolo_pose_dataset("data", "data_split", val_ratio=0.2)
+```
+→ See: [QUICK_START.md - Tasks 4-6](QUICK_START.md), [API_CHEATSHEET.md - Dataset Operations](API_CHEATSHEET.md)
+
+---
+
+## ❓ FAQ
+
+**Q: How do I load a dataset?**  
+A: Use `YOLOPoseDataset("data.yaml")` — See [QUICK_START.md - Task 1](QUICK_START.md)
+
+**Q: How do I get LBP features?**  
+A: Use `YPImageValidation` for images or `YPSetValidation` for datasets — See [QUICK_START.md - Tasks 2-3](QUICK_START.md)
+
+**Q: Where's the complete API?**  
+A: Check [API_CHEATSHEET.md](API_CHEATSHEET.md) for all functions and classes
+
+**Q: How does the project structure work?**  
+A: Read [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)
 
 **Total: 1 minute + lookup**
 

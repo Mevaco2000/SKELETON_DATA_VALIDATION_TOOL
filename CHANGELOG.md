@@ -1,48 +1,58 @@
 # Changelog
 
-## [0.2.0] - 2026-03-03
+## [0.2.0] - 2026-03-04
 
 ### Added
 
-#### Validation Module - LBP Feature Extraction
-- **YOLOPoseDataset Class** — Unified dataset interface
-  - Supports data.yaml input (auto-detects train/val/test splits)
-  - Supports train.txt and args.yaml inputs
-  - Iterator interface for memory-efficient loading
-  - Methods for feature extraction:
-    - `get_all_lbp_histograms(patch_size)` — Compute all LBP histograms
-    - `get_all_lbp_decimals(patch_size)` — Compute binary decimals
-    - `iterate_with_lbp(patch_size)` — Iterate with features
-    - `apply_function_to_all(func)` — Apply custom functions
-    - `get_sample_with_features(idx, patch_size)` — Single sample with features
-    - `create_dataframe(patch_size)` — Export to pandas DataFrame
-    - `visualize_sample(idx, patch_size)` — Visualize with patches
+#### Validation Module - Image and Dataset Classes
+- **YPImageValidation Class** — Per-image LBP feature extraction
+  - `compute_lbp_histograms(patch_size)` — LBP histograms for all keypoints
+  - `compute_lbp_decimals(patch_size)` — Binary decimal representations
+  - `compute_lbp_histogram_single(x, y, patch_size)` — Single keypoint histogram
+  - `compute_lbp_decimal_single(x, y, patch_size)` — Single keypoint decimal
+  - `sequential_distances(visibility_threshold)` — Distance between keypoints
+  - `visualize(patch_size)` — Visualize with LBP patches
+  - Static: `load_keypoints()`, `draw_keypoints_on_image()`, `compute_sequential_distances()`
 
-- **LBP Core Functions** — Enhanced with dataset examples
-  - `compute_lbp_for_image()` — LBP histograms for all keypoints
-  - `compute_lbp_for_keypoints()` — Alias with same functionality
-  - `compute_lbp_histogram()` — Single keypoint LBP
-  - `compute_lbp_value()` — Basic 3x3 LBP computation
-  - `compute_lbp_binary_decimal()` — Binary decimal representation
-  - `patch_to_binary_decimal()` — Patch to decimal conversion
+- **YPSetValidation Class** — Dataset-level feature extraction
+  - `from_yolo_dataset(dataset, patch_size)` — Create from YOLOPoseDataset
+  - `get_all_lbp_histograms()` — Extract all LBP histograms
+  - `get_all_lbp_decimals()` — Extract all binary decimals
+  - `create_dataframe()` — Export to pandas DataFrame
+
+#### Dataset Module - Core Classes
+- **YOLOPoseImage** — Single imagewith annotations
+  - Load image and keypoints
+  - Access normalized coordinates
+  - To/from dict conversion
+
+- **YOLOPoseDataset** — Full dataset management
+  - Load from data.yaml, train.txt, or args.yaml
+  - Iterator interface
+  - Get statistics and paths
+  - Efficient memory usage
 
 ### Changed
 
 #### Code Organization
-- **Removed redundant functions** (consolidated into YOLOPoseDataset):
-  - ~~`compute_lbp_batch()`~~ → Use `dataset.get_all_lbp_histograms()`
-  - ~~`load_image_and_keypoints()`~~ → Use `dataset[idx]`
-  - ~~`load_image_and_keypoints_from_dataset()`~~ → Use `for sample in dataset`
-  - ~~`load_images_from_dataset()`~~ → Use `dataset` iteration
-  - ~~`compute_lbp_for_dataset()`~~ → Use `dataset.get_all_lbp_histograms()`
+- **validation/**: Now includes
+  - `image_validation.py` — YPImageValidation class
+  - `set_validation.py` — YPSetValidation class
+  - `helpers.py` — Utility functions
+  - `analysis.py` — Group analysis
 
-- **evaluation.py** — Reduced from 1176 to 950 lines
-  - Better code organization with class-based interface
-  - All standalone functions retained with enhanced examples
+- **datasets/**: Now includes
+  - `yolo_pose_dataset.py` — YOLOPoseDataset and YOLOPoseImage classes
+  - `operations.py` — Dataset operations
+
+### Deprecated
+- References to non-existent modules (duplicates.py, evaluation.py)
+- Stand-alone LBP computation functions (now in YPImageValidation)
 
 ### Fixed
-- Fixed duplicate docstrings in `compute_lbp_for_image()`
-- Corrected indentation in docstring examples
+- Consolidated class-based interface for cleaner API
+- Removed redundant function definitions
+- Improved code organization and maintainability
 
 ---
 
@@ -51,53 +61,40 @@
 ### Added
 
 #### Validation Module
-- **helpers.py**: Keypoint loading, distance calculations, and visualization
-  - `load_keypoints()` — Load keypoints from YOLO labels
-  - `sequential_distances()` — Calculate keypoint-to-keypoint distances
-  - `draw_keypoints()` — Draw keypoints on images
-
-- **duplicates.py**: CLIP-based duplicate detection
-  - `generate_clip_embeddings()` — Generate CLIP embeddings for images
-  - `find_near_duplicates()` — Find similar images using FAISS
-  - Private helpers: `_load_clip_model()`, `_compute_embeddings()`, `_build_similarity_groups()`
+- **helpers.py**: Keypoint utilities
+  - `load_keypoints()` — Load labels from YOLO files
+  - `draw_keypoints()` — Visualize keypoints
 
 - **analysis.py**: Group analysis and reporting
-  - `generate_group_visualizations()` — Create PNG visualizations with overlaid keypoints
-  - `save_groups_analysis()` — Export groups to JSON with distance vectors
-  - `analyze_hidden_keypoints()` — Detect hidden/invalid keypoints
-  - `export_groups_analysis_to_excel()` — Generate Excel reports with statistics
-
-- **evaluation.py**: YOLO model training and evaluation
-  - `train_yolo_pose_model()` — Train YOLO pose models with registry support
-  - `load_yolo_pose_label()` — Load labels as keypoint arrays
-  - `evaluate_model_on_dataset()` — Generate detailed error reports
+  - `generate_group_visualizations()` — PNG visualizations
+  - `save_groups_analysis()` — JSON export
+  - `analyze_hidden_keypoints()` — Visibility analysis
+  - `export_groups_analysis_to_excel()` — Excel reports
 
 #### Datasets Module
-- **operations.py**: Dataset manipulation utilities
-  - `flatten_cvat_yolo_pose()` — Flatten nested CVAT structures
-  - `merge_yolo_pose_datasets()` — Merge multiple datasets with conflict handling
-  - `split_yolo_pose_dataset()` — Split into train/validation sets
-  - `convert_yolo_pose_to_cvat()` — Convert to CVAT ZIP format
-  - `extract_image_subset()` — Extract images by index range
+- **operations.py**: Dataset manipulation
+  - `flatten_cvat_yolo_pose()` — Flatten CVAT structures
+  - `merge_yolo_pose_datasets()` — Merge multiple datasets
+  - `split_yolo_pose_dataset()` — Train/validation split
+  - `convert_yolo_pose_to_cvat()` — Convert to CVAT format
+  - `extract_image_subset()` — Extract by index range
 
 #### Configuration
 - **config.py**: Centralized constants
-  - Model registry with predefined paths
-  - Image format whitelist
-  - CLIP model settings
-  - Default thresholds for similarity and duplicate detection
-  - Default YOLO training parameters
+  - Model registry
+  - Image format settings
+  - Default thresholds
 
 #### Package Structure
-- Professional `__init__.py` files with clean API exports
-- Full type hints on all functions
-- NumPy-style docstrings for all public functions
-- Module-level documentation strings
+- Professional module organization
+- Clean `__init__.py` exports
+- Full type hints
+- NumPy-style docstrings
 
 ### Documentation
-- **README.md**: Comprehensive documentation with 5 sections and full API reference
-- **QUICK_START.md**: 5-minute setup guide with common usage patterns
-- **CHANGELOG.md**: Version history and change tracking
+- README.md — Full API documentation
+- QUICK_START.md — 5-minute setup guide
+- CHANGELOG.md — Version tracking
 
 ### Type Safety
 - Full type annotations on all parameters and return values

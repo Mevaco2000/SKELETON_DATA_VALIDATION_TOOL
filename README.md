@@ -61,12 +61,13 @@ utils/
 ├── validation/                  # Image validation & analysis
 │   ├── __init__.py
 │   ├── helpers.py              # Keypoint utilities
-│   ├── duplicates.py           # CLIP embeddings & duplicate detection
-│   ├── analysis.py             # Group analysis & Excel export
-│   └── evaluation.py           # YOLO model training & evaluation
+│   ├── image_validation.py     # Per-image LBP and feature extraction (YPImageValidation)
+│   ├── set_validation.py       # Dataset-level analysis (YPSetValidation)
+│   └── analysis.py             # Group analysis & Excel export
 │
 └── datasets/                    # Dataset manipulation
     ├── __init__.py
+    ├── yolo_pose_dataset.py    # YOLO dataset handling (YOLOPoseImage, YOLOPoseDataset)
     └── operations.py           # Dataset operations (flatten, merge, split, convert)
 ```
 
@@ -76,44 +77,61 @@ utils/
 
 ### 1. **Validation Module** (`utils.validation`)
 
-Handles image validation, duplicate detection, and model evaluation.
+Handles image validation, LBP feature extraction, and analysis.
 
-#### Submodules:
+#### Main Classes:
 
-**helpers.py** — Keypoint utilities
-- `load_keypoints()` — Load keypoints from YOLO label files
-- `sequential_distances()` — Calculate distances between consecutive keypoints
-- `train_distance_models()` / `predict_distances()` — simple scikit‑learn regressors that predict one sequential distance from the others
-- `draw_keypoints()` — Draw keypoints on images
+**YPImageValidation** — Per-image LBP and feature extraction
+- `compute_lbp_histograms(patch_size)` — LBP histograms for all keypoints in image
+- `compute_lbp_decimals(patch_size)` — Binary decimal representation for keypoints
+- `compute_lbp_histogram_single(x, y, patch_size)` — Single keypoint LBP histogram
+- `compute_lbp_decimal_single(x, y, patch_size)` — Single keypoint decimal representation
+- `sequential_distances(visibility_threshold)` — Distances between consecutive keypoints
+- `visualize(patch_size)` — Visualize keypoints with LBP patches
 
-**duplicates.py** — Duplicate detection using CLIP
-- `generate_clip_embeddings()` — Generate CLIP embeddings for images
-- `find_near_duplicates()` — Find similar images based on embeddings
+**YPSetValidation** — Dataset-level operations
+- `from_yolo_dataset(dataset, patch_size)` — Create from YOLOPoseDataset
+- `get_all_lbp_histograms()` — Get all LBP histograms for dataset
+- `get_all_lbp_decimals()` — Get all binary decimals for dataset
+- `create_dataframe()` — Export features to pandas DataFrame
 
-**analysis.py** — Group analysis & reporting
+**Analysis Functions** — Group visualization and reporting
 - `generate_group_visualizations()` — Create visual group reports
 - `save_groups_analysis()` — Save group data to JSON
 - `analyze_hidden_keypoints()` — Analyze hidden/invalid keypoints
 - `export_groups_analysis_to_excel()` — Export statistics to Excel
 
-**evaluation.py** — LBP Feature Extraction & Dataset Management
-- `YOLOPoseDataset` — Class for loading and processing YOLO Pose datasets with flexible LBP computation
-  - Supports data.yaml, args.yaml, and train.txt inputs
-  - Auto-detects train/val/test splits from data.yaml
-  - Iterator interface for samples (image + keypoints)
-  - Methods: `get_all_lbp_histograms()`, `get_all_lbp_decimals()`, `iterate_with_lbp()`, `apply_function_to_all()`
-  - Creates pandas DataFrames with features
-  - Visualizes samples with keypoints and patches
-- LBP Core Functions (Local Binary Pattern analysis):
-  - `compute_lbp_value()` — Compute LBP for single 3x3 neighborhood
-  - `compute_lbp_histogram()` — Compute LBP histogram for single keypoint
-  - `compute_lbp_for_image()` — Compute LBP for all keypoints in image
-  - `compute_lbp_for_keypoints()` — Alias for `compute_lbp_for_image()`
-  - `compute_lbp_binary_decimal()` — Binary decimal representation of patches
-  - `patch_to_binary_decimal()` — Convert patch to binary/decimal
-- Variable radius LBP (circular sampling):
-  - `compute_lbp_value_variable_radius()` — Circular LBP sampling
-  - `compute_lbp_histogram_variable_radius()` — Variable radius histograms
+**helpers.py** — Keypoint utilities
+- `load_keypoints()` — Load keypoints from YOLO label files
+- `draw_keypoints()` — Draw keypoints on images
+
+**analysis.py** — Group visualization and reporting
+- `generate_group_visualizations()` — Create visual group reports
+- `save_groups_analysis()` — Save group data to JSON
+- `analyze_hidden_keypoints()` — Analyze hidden/invalid keypoints
+- `export_groups_analysis_to_excel()` — Export statistics to Excel
+
+---
+
+#### Alternative: YPSetValidation for Dataset-Level Operations
+
+For full dataset analysis, use `YPSetValidation`:
+
+```python
+from utils.validation import YPSetValidation, YOLOPoseDataset
+
+# Create from YOLOPoseDataset
+dataset = YOLOPoseDataset("data.yaml")
+validator = YPSetValidation.from_yolo_dataset(dataset, patch_size=5)
+
+# Get all LBP features
+histograms = validator.get_all_lbp_histograms()  # (total_keypoints, 256)
+decimals = validator.get_all_lbp_decimals()      # (total_keypoints,)
+
+# Export to DataFrame
+df = validator.create_dataframe()
+df.to_csv("features.csv")
+```
 
 ---
 
@@ -189,359 +207,213 @@ DEFAULT_THRESHOLD_DUPLICATES = 0.99    # Find near-duplicates
 ### YOLOPoseDataset Class
 
 Unified interface for loading and processing YOLO Pose datasets with optional LBP computation.
+---
 
-**Key Features:**
-- Loads images + keypoints from YOLO format datasets
-- Supports multiple input formats: `data.yaml`, `train.txt`, `args.yaml`
-- Auto-detects train/val/test splits from `data.yaml`
-- Flexible feature computation: LBP histograms or binary decimals
-- Iterator interface for memory-efficient batch processing
-- Converts to pandas DataFrames for analysis
-- Visualizes samples with keypoints and patches
+## NEW: LBP Feature Extraction
 
-**Quick Example:**
+### YPImageValidation - Per-Image LBP Feature Extraction
+
+The `YPImageValidation` class provides powerful LBP (Local Binary Pattern) feature extraction for individual images.
 
 ```python
-from utils.validation import YOLOPoseDataset
+from utils.validation import YPImageValidation
+import cv2
+import numpy as np
 
-# Load dataset (auto-detects split from data.yaml)
-dataset = YOLOPoseDataset("path/to/data.yaml")
+# Create validator for single image
+image = cv2.imread("image.jpg", cv2.IMREAD_GRAYSCALE)
+keypoints = np.array([[100, 50], [150, 200]])  # (N, 2) with [x, y]
 
-# Get basic stats
-print(dataset.stats)  # Total images, keypoints, etc.
+validator = YPImageValidation(image, keypoints)
 
-# Get all LBP histograms in ONE COMMAND
-histograms, counts, paths = dataset.get_all_lbp_histograms(patch_size=5)
-# Returns: (total_keypoints, 256) histogram array
+# Get LBP histograms for all keypoints
+histograms = validator.compute_lbp_histograms(patch_size=5)  # (N, 256)
 
-# Or iterate with LBP features
-for sample in dataset.iterate_with_lbp(patch_size=5):
-    hist = sample['lbp_histogram']  # (N, 256)
-    decimal = sample['lbp_decimal']  # (N,)
-    
-# Use standalone functions with dataset
-from utils.validation import compute_lbp_for_image
-for sample in dataset:
-    hist = compute_lbp_for_image(
-        sample['image'],
-        sample['keypoints'],
-        patch_size=5
-    )
+# Get binary decimal representation
+decimals = validator.compute_lbp_decimals(patch_size=7)  # (N,)
+
+# Compute for single keypoint
+single_hist = validator.compute_lbp_histogram_single(100, 50, patch_size=5)  # (256,)
+
+# Calculate distances between consecutive keypoints
+distances = validator.sequential_distances(visibility_threshold=0.5)
+
+# Visualize results
+visualized = validator.visualize(patch_size=5)
+cv2.imshow("Visualization", visualized)
 ```
+
+**Key Methods:**
+- `compute_lbp_histograms(patch_size)` — LBP histograms for all keypoints (N, 256)
+- `compute_lbp_decimals(patch_size)` — Binary decimal representation (N,)
+- `compute_lbp_histogram_single(x, y, patch_size)` — Single keypoint histogram (256,)
+- `compute_lbp_decimal_single(x, y, patch_size)` — Single keypoint decimal
+- `sequential_distances(visibility_threshold)` — Distance between consecutive keypoints
+- `visualize(patch_size)` — Draw keypoints with LBP patches
+
+### YPSetValidation - Dataset-Level Operations
+
+For processing entire datasets efficiently:
+
+```python
+from utils.validation import YPSetValidation
+from utils.datasets import YOLOPoseDataset
+
+# Load dataset
+dataset = YOLOPoseDataset("data.yaml")
+
+# Create validator
+validator = YPSetValidation.from_yolo_dataset(dataset, patch_size=5)
+
+# Get all histograms at once
+histograms = validator.get_all_lbp_histograms()  # (total_keypoints, 256)
+
+# Get all decimals
+decimals = validator.get_all_lbp_decimals()      # (total_keypoints,)
+
+# Export to pandas DataFrame
+df = validator.create_dataframe()
+print(df.head())
+df.to_csv("lbp_features.csv")
+```
+
 
 ---
 
-## Usage Examples
+## API Reference
 
-### Example 6: LBP Feature Extraction from Dataset
-
-```python
-from utils.validation import YOLOPoseDataset
-
-# Initialize dataset from data.yaml
-dataset = YOLOPoseDataset("./data/data.yaml")
-
-# Method 1: Get all LBP histograms at once (fastest)
-histograms, counts, paths = dataset.get_all_lbp_histograms(patch_size=5)
-print(f"Extracted {histograms.shape[0]} keypoint histograms")
-
-# Method 2: Get binary decimal representation (alternative feature)
-decimals, counts, paths = dataset.get_all_lbp_decimals(patch_size=7)
-print(f"Binary decimals: {decimals.shape} dtype: {decimals.dtype}")
-
-# Method 3: Create pandas DataFrame with all features
-df = dataset.create_dataframe(patch_size=5)
-df.to_csv("lbp_features.csv")  # Export for analysis
-
-# Method 4: Iterate with custom feature extraction
-def custom_feature(sample, patch_size=5):
-    from utils.validation import compute_lbp_for_image
-    return compute_lbp_for_image(
-        sample['image'],
-        sample['keypoints'],
-        patch_size
-    )
-
-features = dataset.apply_function_to_all(custom_feature, patch_size=7)
-```
-
----
+### Validation Module - YPImageValidation
 
 ```python
-from utils import generate_clip_embeddings, find_near_duplicates, extract_image_subset
+validator = YPImageValidation(image, keypoints)
 
-# Generate CLIP embeddings
-embeddings, filenames = generate_clip_embeddings(
-    image_folder="./data/images",
-    device="cuda"  # or "cpu"
-)
+# LBP Feature Extraction
+histograms = validator.compute_lbp_histograms(patch_size=5)       # (N, 256)
+decimals = validator.compute_lbp_decimals(patch_size=7)           # (N,)
+single_hist = validator.compute_lbp_histogram_single(x, y)        # (256,)
+single_dec = validator.compute_lbp_decimal_single(x, y)           # scalar
 
-# Find near-duplicates
-duplicates = find_near_duplicates(
-    embeddings=embeddings,
-    filenames=filenames,
-    threshold=0.99,
-    k=10
-)
+# Distance Analysis
+distances = validator.sequential_distances(visibility_threshold=0.5)  # (N-1,)
 
-print(f"Found {len(duplicates)} duplicate pairs")
-
-# Extract subset of images
-extract_image_subset(
-    images_path="./data/images",
-    output_dir="./data/subset",
-    a=0,
-    b=100
-)
+# Visualization
+result = validator.visualize(patch_size=5)
 ```
 
-### Example 2: Train YOLO Pose Model
+### Validation Module - YPSetValidation
 
 ```python
-from utils import train_yolo_pose_model, evaluate_model_on_dataset
+validator = YPSetValidation.from_yolo_dataset(dataset, patch_size=5)
 
-# Train model
-model = train_yolo_pose_model(
-    model_key="custom\",              # or provide path directly
-    dataset_yaml_path="./data/data.yaml",
-    epochs=50,
-    imgsz=640,
-    batch=16,
-    device="cuda"
-)
+# Get all features
+histograms = validator.get_all_lbp_histograms()  # (total_keypoints, 256)
+decimals = validator.get_all_lbp_decimals()      # (total_keypoints,)
 
-# Evaluate on validation set
-report = evaluate_model_on_dataset(
-    model_or_path=model,
-    images_dir="./data/images/val",
-    labels_dir="./data/labels/val"
-)
-
-print(f"Mean error: {report['summary']['overall_mean_error']:.4f}")
-print(f"Worst keypoints: {report['worst_keypoints_global'][:5]}")
+# Export
+df = validator.create_dataframe()
+df.to_csv("features.csv")
 ```
 
-### Example 3: Analyze Image Groups
+### Validation Module - Analysis Functions
 
 ```python
 from utils.validation import (
-    generate_clip_embeddings,
-    build_similarity_groups,
     generate_group_visualizations,
     save_groups_analysis,
+    analyze_hidden_keypoints,
     export_groups_analysis_to_excel
 )
 
-# Generate embeddings and find groups
-embeddings, filenames = generate_clip_embeddings("./data/images")
-
-# Note: _build_similarity_groups is private, use through run_duplicate_analysis
-from utils.validation.duplicates import _build_similarity_groups
-
-groups = _build_similarity_groups(embeddings, threshold=0.98)
-
 # Visualize groups
-generate_group_visualizations(
-    groups=groups,
-    filenames=filenames,
-    image_folder="./data/images",
-    label_folder="./data/labels",
-    output_folder="./output/visualizations"
-)
+generate_group_visualizations(groups, filenames, image_folder, label_folder, output_folder)
 
-# Export analysis
-save_groups_analysis(
-    groups=groups,
-    filenames=filenames,
-    label_folder="./data/labels",
-    output_json="./output/groups_analysis.json"
-)
+# Save analysis
+save_groups_analysis(groups, filenames, label_folder, output_json)
 
-# Create Excel report
-export_groups_analysis_to_excel(
-    json_path="./output/groups_analysis.json",
-    output_path="./output/groups_report.xlsx"
-)
+# Analyze visibility
+analyze_hidden_keypoints(label_folder, output_json)
+
+# Export report
+export_groups_analysis_to_excel(json_path, output_path)
 ```
 
-### Example 4: Dataset Operations
+### Datasets Module - YOLOPoseDataset
+
+```python
+dataset = YOLOPoseDataset("data.yaml")
+
+# Properties
+len(dataset)                      # Total images
+dataset.get_stats()               # Dictionary of stats
+dataset.get_image_paths()         # List of paths
+dataset.get_label_paths()         # List of label paths
+
+# Iteration
+for sample in dataset:
+    image = sample['image']       # numpy array
+    keypoints = sample['keypoints']  # (N, 2) or (N, 3)
+    image_path = sample['image_path']
+    label_path = sample['label_path']
+
+# Direct access
+sample = dataset[0]
+```
+
+### Datasets Module - YOLOPoseImage
+
+```python
+from utils.datasets import YOLOPoseImage
+
+img = YOLOPoseImage("image.jpg", "image.txt")
+
+# Access data
+print(img.image)         # numpy array
+print(img.keypoints)     # (N, 2) or (N, 3)
+print(img.image_path)
+print(img.label_path)
+```
+
+### Datasets Module - Operations
 
 ```python
 from utils.datasets import (
     flatten_cvat_yolo_pose,
     merge_yolo_pose_datasets,
     split_yolo_pose_dataset,
-    convert_yolo_pose_to_cvat
+    convert_yolo_pose_to_cvat,
+    extract_image_subset
 )
 
-# Flatten nested CVAT structure
-flatten_cvat_yolo_pose(
-    input_root="./raw_data/cvat_export",
-    output_root="./data/flat_dataset"
-)
+# Flatten CVAT structure
+flatten_cvat_yolo_pose(input_root, output_root)
 
-# Merge two datasets
-merge_yolo_pose_datasets(
-    dataset1_root="./data/dataset1",
-    dataset2_root="./data/dataset2",
-    output_root="./data/merged"
-)
+# Merge datasets
+merge_yolo_pose_datasets(dataset1_root, dataset2_root, output_root)
 
 # Split into train/validation
-split_yolo_pose_dataset(
-    dataset_root="./data/merged",
-    output_root="./data/split",
-    val_ratio=0.2,
-    seed=42
-)
+split_yolo_pose_dataset(dataset_root, output_root, val_ratio=0.2, seed=42)
 
-# Convert to CVAT format
-convert_yolo_pose_to_cvat(
-    dataset_root="./data/split",
-    output_zip_dir="./output/cvat_export"
-)
+# Convert format
+convert_yolo_pose_to_cvat(dataset_root, output_zip_dir)
+
+# Extract subset
+extract_image_subset(images_path, output_dir, a=0, b=100)
 ```
 
-### Example 5: Load & Analyze Keypoints
+### Helpers Module
 
 ```python
-from utils import load_keypoints, sequential_distances, draw_keypoints
-import cv2
-import numpy as np
+from utils.validation import YPImageValidation
 
-# Load keypoints from label file
-keypoints = load_keypoints("./data/labels/image_001.txt")
-print(f"Keypoints shape: {keypoints.shape}")  # (N, 2)
-
-# Calculate distances between consecutive keypoints
-distances = sequential_distances(keypoints)
-print(f"Mean distance: {np.mean(distances):.4f}")
+# Load keypoints from file
+keypoints = YPImageValidation.load_keypoints("labels/image.txt")  # (N, 2)
 
 # Draw keypoints on image
-image = cv2.imread("./data/images/image_001.jpg")
-image_with_kp = draw_keypoints(image, keypoints, color=(0, 255, 0))
-cv2.imwrite("./output/image_with_keypoints.jpg", image_with_kp)
+marked = YPImageValidation.draw_keypoints_on_image(image, keypoints, color=(0, 255, 0))
+
+# Calculate sequential distances
+distances = YPImageValidation.compute_sequential_distances(keypoints)  # (N-1,)
 ```
-
----
-
-## API Reference
-
-### Validation Module
-
-#### `load_keypoints(label_path: str) → np.ndarray`
-Load keypoints from YOLO pose label file.
-- **Args:** `label_path` — Path to .txt label file
-- **Returns:** Array of shape (N, 2) with normalized keypoints
-- **Raises:** `FileNotFoundError` if file doesn't exist
-
-#### `sequential_distances(keypoints: np.ndarray) → np.ndarray`
-
-#### `train_distance_models(distance_matrix: np.ndarray, model_factory: Callable = LinearRegression, exclude_endpoints: bool = True) → List[BaseEstimator]`
-Train a separate regression model for each interior distance in a set of
-sequential distances.  See :mod:`utils.validation.analysis` for details.
-
-#### `predict_distances(models: Sequence[BaseEstimator], distances: Union[np.ndarray, Sequence[np.ndarray]], exclude_endpoints: bool = True) → np.ndarray`
-Use previously trained models to obtain predictions for new distance
-vectors.
-Calculate distances between consecutive keypoints.
-- **Args:** `keypoints` — Array of shape (N, 2)
-- **Returns:** Array of shape (N-1,) with distances
-
-#### `draw_keypoints(image: np.ndarray, keypoints: np.ndarray, color: tuple) → np.ndarray`
-Draw keypoints on image as circles.
-- **Args:**
-  - `image` — Input image (numpy array)
-  - `keypoints` — Normalized coordinates [0, 1]
-  - `color` — RGB color tuple
-- **Returns:** Modified image
-
-#### `generate_clip_embeddings(image_folder: str, device: Optional[str]) → Tuple[np.ndarray, List[str]]`
-Generate CLIP embeddings for all images.
-- **Args:**
-  - `image_folder` — Path to folder with images
-  - `device` — "cuda" or "cpu" (auto-detects if None)
-- **Returns:** (embeddings array, list of filenames)
-- **Auto-skips:** Invalid/corrupted images
-
-#### `find_near_duplicates(embeddings: np.ndarray, filenames: List[str], k: int, threshold: float) → List[Tuple]`
-Find near-duplicate images.
-- **Args:**
-  - `embeddings` — CLIP embeddings array
-  - `filenames` — Image filenames
-  - `k` — Number of neighbors to search (default: 10)
-  - `threshold` — Similarity threshold (default: 0.99)
-- **Returns:** List of (file1, file2, similarity) tuples
-
-#### `generate_group_visualizations(...) → None`
-Create PNG visualizations with overlaid keypoints.
-- **Output:** PNG files in `output_folder/`
-
-#### `save_groups_analysis(...) → None`
-Save group analysis with distance vectors to JSON.
-- **Output:** `groups_analysis.json`
-
-#### `analyze_hidden_keypoints(label_folder: str, output_json: str) → None`
-Analyze hidden/invalid keypoints in labels.
-- **Output:** JSON report of hidden keypoints
-
-#### `export_groups_analysis_to_excel(json_path: str, output_path: str) → None`
-Export group statistics to Excel with mean calculations.
-- **Output:** `.xlsx` file with formatted statistics
-
-#### `train_yolo_pose_model(...) → YOLO`
-Train YOLO pose model on dataset.
-- **Args:**
-  - `model_key` — \"custom\" (or provide custom path)
-  - `dataset_yaml_path` — Path to data.yaml
-  - `epochs` — Training epochs (default: 100)
-  - `batch` — Batch size (default: 16)
-- **Returns:** Trained YOLO model instance
-- **Raises:** `FileNotFoundError`, `ValueError` for invalid models
-
-#### `evaluate_model_on_dataset(...) → Dict`
-Generate detailed evaluation report with error analysis.
-- **Returns:** Dictionary with:
-  - `summary` — Overall statistics
-  - `worst_images` — Images sorted by error
-  - `worst_keypoints_global` — Problematic keypoints
-- **Returns:** `None` if no valid results
-
----
-
-### Datasets Module
-
-#### `flatten_cvat_yolo_pose(input_root: str, output_root: str, copy_data_yaml: bool) → None`
-Flatten nested CVAT structure to flat images/labels.
-- **Args:**
-  - `input_root` — Root of nested dataset
-  - `output_root` — Output directory
-  - `copy_data_yaml` — Copy data.yaml file (default: True)
-- **Output:** Flat directory with `images/`, `labels/`, `train.txt`
-
-#### `merge_yolo_pose_datasets(dataset1_root: str, dataset2_root: str, output_root: str) → None`
-Merge two YOLO datasets with conflict handling.
-- **Output:** Merged dataset with prefixed filenames for conflicts
-
-#### `split_yolo_pose_dataset(dataset_root: str, output_root: str, val_ratio: float, seed: int) → None`
-Split dataset into train/validation sets.
-- **Args:**
-  - `val_ratio` — Fraction for validation (default: 0.2)
-  - `seed` — Random seed (default: 42)
-- **Output:** `images/train`, `images/val`, `labels/train`, `labels/val`, `train.txt`, `val.txt`
-
-#### `convert_yolo_pose_to_cvat(dataset_root: str, output_zip_dir: str) → None`
-Convert YOLO format to CVAT ZIP archives.
-- **Output:** `images.zip`, `annotations.zip`
-
-#### `extract_image_subset(images_path: str, output_dir: str, a: int, b: int) → None`
-Extract images by index range. Useful for subsetting large datasets.
-- **Args:**
-  - `images_path` — Source image folder
-  - `output_dir` — Destination folder
-  - `a` — Start index (inclusive)
-  - `b` — End index (inclusive)
-- **Raises:** `IndexError` if range out of bounds, `ValueError` if a > b
 
 ---
 
@@ -560,6 +432,86 @@ The package validates input paths and raises informative errors:
 - `FileNotFoundError` — Missing files or directories
 - `IndexError` — Out-of-bounds parameters
 - `ValueError` — Invalid parameter values
+
+### Memory Efficiency
+
+For large datasets, use iterators:
+```python
+# Good - memory efficient
+for sample in dataset:
+    process(sample)
+
+# Avoid - loads all data at once
+data = [sample for sample in dataset]
+```
+
+### Visibility Scores
+
+Some keypoint arrays include visibility scores (N, 3) with [x, y, visibility]:
+```python
+keypoints = np.array([[100, 50, 1.0], [150, 200, 0.0]])  # (N, 3)
+distances = validator.sequential_distances(visibility_threshold=0.5)
+```
+
+---
+
+## Configuration
+
+All settings can be optionally customized in `utils/config.py`:
+
+```python
+from utils.config import (
+    MODEL_REGISTRY,
+    VALID_IMAGE_EXTENSIONS,
+    DEFAULT_THRESHOLD_SIMILARITY,
+    DEFAULT_THRESHOLD_DUPLICATES
+)
+
+# View defaults
+print(VALID_IMAGE_EXTENSIONS)  # ['.jpg', '.png', ...]
+```
+
+---
+
+## Troubleshooting
+
+**Q: Import errors with utils**  
+A: Ensure requirements are installed and you're using correct paths:
+```bash
+pip install -r requirements.txt
+```
+
+**Q: Dataset loading fails**  
+A: Verify data.yaml exists and paths are correct:
+```python
+import os
+assert os.path.exists("data.yaml")
+dataset = YOLOPoseDataset("data.yaml")
+```
+
+**Q: LBP feature extraction is slow**  
+A: Use `YPSetValidation` for batch operations (faster than per-image):
+```python
+# Fast
+validator = YPSetValidation.from_yolo_dataset(dataset)
+features = validator.get_all_lbp_histograms()
+
+# Slow (don't do this)
+for sample in dataset:
+    validator = YPImageValidation(sample['image'], sample['keypoints'])
+    features = validator.compute_lbp_histograms()
+```
+
+**Q: Out of memory with large datasets**  
+A: Use iteration instead of loading all at once:
+```python
+# Good
+for sample in dataset:
+    process(sample)
+
+# Bad
+samples = list(dataset)  # Loads everything into memory
+```
 
 ### Device Management
 

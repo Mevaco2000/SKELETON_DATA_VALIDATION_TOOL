@@ -10,35 +10,150 @@ pip install -r requirements.txt
 
 ### 2. Basic Import
 ```python
-from utils import load_keypoints, generate_clip_embeddings, train_yolo_pose_model
+from utils.datasets import YOLOPoseDataset
+from utils.validation import YPImageValidation, YPSetValidation
 ```
 
 ---
 
 ## Common Tasks
 
-### Find Duplicate Images
+### Task 1: Load a Dataset
+
 ```python
-from utils import generate_clip_embeddings, find_near_duplicates
+from utils.datasets import YOLOPoseDataset
 
-# Get embeddings
-embeddings, filenames = generate_clip_embeddings("./images")
+# Load from data.yaml
+dataset = YOLOPoseDataset("path/to/data.yaml")
 
-# Find duplicates
-duplicates = find_near_duplicates(embeddings, filenames, threshold=0.99)
-print(f"Found {len(duplicates)} duplicate pairs")
+# Or from train.txt
+dataset = YOLOPoseDataset("path/to/train.txt")
+
+# Get info
+print(f"Total images: {len(dataset)}")
+print(f"Stats: {dataset.get_stats()}")
+
+# Iterate through samples
+for sample in dataset:
+    image = sample['image']          # numpy array (H, W, 3)
+    keypoints = sample['keypoints']  # (N, 2) or (N, 3)
+    print(f"Image: {sample['image_path']}, Keypoints: {keypoints.shape}")
+    
+    # Stop after first 5
+    if len([1 for _ in range(5)]) > 0:
+        break
 ```
 
 **Output:**
 ```
-('image_001.jpg', 'image_105.jpg', 0.992)
-('image_042.jpg', 'image_200.jpg', 0.995)
-...
+Total images: 1001
+Stats: {'total_images': 1001, 'total_keypoints': 5005, ...}
+Image: ./images/image_001.jpg, Keypoints: (5, 2)
 ```
 
 ---
 
-### Extract Image Subset
+### Task 2: Extract LBP Features from Single Image
+
+```python
+from utils.validation import YPImageValidation
+from utils.datasets import YOLOPoseImage
+
+# Load single image with keypoints
+yolo_img = YOLOPoseImage("path/to/image.jpg", "path/to/image.txt")
+
+# Create validator
+validator = YPImageValidation(yolo_img.image, yolo_img.keypoints)
+
+# Get LBP histograms for all keypoints
+histograms = validator.compute_lbp_histograms(patch_size=5)
+print(f"Histograms shape: {histograms.shape}")  # (N, 256)
+
+# Get binary decimal representation
+decimals = validator.compute_lbp_decimals(patch_size=7)
+print(f"Decimals shape: {decimals.shape}")  # (N,)
+
+# Calculate distances between keypoints
+distances = validator.sequential_distances(visibility_threshold=0.5)
+print(f"Distances: {distances}")
+```
+
+**Output:**
+```
+Histograms shape: (5, 256)
+Decimals shape: (5,)
+Distances: [23.5, 45.2, 12.1, 33.8]
+```
+
+---
+
+### Task 3: Extract LBP Features from Entire Dataset
+
+```python
+from utils.datasets import YOLOPoseDataset
+from utils.validation import YPSetValidation
+
+# Load dataset
+dataset = YOLOPoseDataset("path/to/data.yaml")
+
+# Create validator for entire dataset
+validator = YPSetValidation.from_yolo_dataset(dataset, patch_size=5)
+
+# Get all LBP histograms in one command
+histograms = validator.get_all_lbp_histograms()
+print(f"Total histograms: {histograms.shape}")  # (total_keypoints, 256)
+
+# Get all decimals
+decimals = validator.get_all_lbp_decimals()
+print(f"Total decimals: {decimals.shape}")  # (total_keypoints,)
+
+# Export to DataFrame
+df = validator.create_dataframe()
+print(df.head())
+df.to_csv("lbp_features.csv")
+```
+
+**Output:**
+```
+Total histograms: (5005, 256)
+Total decimals: (5005,)
+   image_idx  keypoint_idx  lbp_histogram  ... decimal
+0          0              0       [...]     ... 12345
+1          0              1       [...]     ... 23456
+```
+
+---
+
+### Task 4: Split Dataset into Train/Validation
+
+```python
+from utils.datasets import split_yolo_pose_dataset
+
+split_yolo_pose_dataset(
+    dataset_root="./data",
+    output_root="./data_split",
+    val_ratio=0.2,  # 80% train, 20% validation
+    seed=42
+)
+```
+
+**Creates:**
+```
+data_split/
+├── images/
+│   ├── train/
+│   └── val/
+├── labels/
+│   ├── train/
+│   └── val/
+├── train.txt
+└── val.txt
+```
+
+---
+
+### Task 5: Extract Subset of Images
+
 ```python
 from utils.datasets import extract_image_subset
 
@@ -53,50 +168,62 @@ extract_image_subset(
 
 **Output:**
 ```
-✔ Skopiowano 1001 obrazów do ./subset
+✔ Copied 1001 images to ./subset
 ```
 
 ---
 
-### Split Dataset
-```python
-from utils.datasets import split_yolo_pose_dataset
+### Task 6: Merge Two Datasets
 
-split_yolo_pose_dataset(
-    dataset_root="./data",
-    output_root="./data_split",
-    val_ratio=0.2  # 80% train, 20% validation
+```python
+from utils.datasets import merge_yolo_pose_datasets
+
+merge_yolo_pose_datasets(
+    dataset1_root="./data1",
+    dataset2_root="./data2",
+    output_root="./data_merged"
 )
 ```
 
-**Creates:**
-- `data_split/images/train/`
-- `data_split/images/val/`
-- `data_split/labels/train/`
-- `data_split/labels/val/`
-- `data_split/train.txt`
-- `data_split/val.txt`
+**Output:**
+```
+data_merged/
+├── images/
+└── labels/
+
+# Filenames are prefixed to avoid conflicts:
+# dataset1_image_001.jpg
+# dataset2_image_001.jpg  
+```
 
 ---
 
-## Extract LBP Features from Dataset
+## Troubleshooting
 
+**Q: "ModuleNotFoundError: No module named 'utils'"**  
+A: Make sure you're in the correct directory and requirements are installed:
+```bash
+pip install -r requirements.txt
+```
+
+**Q: "cv2 not found"**  
+A: Install opencv-python:
+```bash
+pip install opencv-python
+```
+
+**Q: Dataset loader fails**  
+A: Ensure your data.yaml path is correct and file exists:
 ```python
-from utils.validation import YOLOPoseDataset
+import os
+print(os.path.exists("path/to/data.yaml"))
+```
 
-# Load dataset from data.yaml (auto-detects train/val/test split)
-dataset = YOLOPoseDataset("path/to/data.yaml")
-
-# Get all LBP histograms in ONE COMMAND
-histograms, counts, paths = dataset.get_all_lbp_histograms(patch_size=5)
-print(f"Shape: {histograms.shape}")  # (total_keypoints, 256)
-
-# Or get binary decimal representation
-decimals, counts, paths = dataset.get_all_lbp_decimals(patch_size=7)
-
-# Create pandas DataFrame
-df = dataset.create_dataframe(patch_size=5)
-df.to_csv("features.csv")
+**Q: Memory issues with large datasets**  
+A: Use iterator pattern instead of loading all at once:
+```python
+for sample in dataset:  # Loads one at a time
+    # Process sample
 ```
 
 **Output:**

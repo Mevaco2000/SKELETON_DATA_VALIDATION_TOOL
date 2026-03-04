@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from openpyxl import Workbook
 
-from .helpers import load_keypoints, sequential_distances, draw_keypoints
+from .image_validation import YPImageValidation
 
 
 def generate_group_visualizations(
@@ -51,10 +51,10 @@ def generate_group_visualizations(
             if not os.path.exists(label_path):
                 continue
 
-            kp = load_keypoints(label_path)
+            kp = YPImageValidation.load_keypoints(label_path)
             color = tuple(random.randint(0, 255) for _ in range(3))
 
-            image = draw_keypoints(image, kp, color)
+            image = YPImageValidation.draw_keypoints_on_image(image, kp, color)
             legend_entries.append((f"(idx={idx})", color))
 
         output_path = os.path.join(output_folder, f"group_{i}.png")
@@ -106,8 +106,8 @@ def save_groups_analysis(
             entry = {"filename": img_name, "index": int(idx)}
 
             if os.path.exists(label_path):
-                kp = load_keypoints(label_path)
-                dist_vector = sequential_distances(kp)
+                kp = YPImageValidation.load_keypoints(label_path)
+                dist_vector = YPImageValidation.compute_sequential_distances(kp)
                 entry["distance_vector"] = [
                     round(float(d), 2) for d in dist_vector
                 ]
@@ -265,262 +265,6 @@ def export_groups_analysis_to_excel(json_path: str, output_path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# distance prediction helpers using scikit-learn
+# group visualization and analysis functions
 # ---------------------------------------------------------------------------
-from typing import Callable, Sequence, List, Union
 
-try:
-    from sklearn.base import BaseEstimator
-    # a handful of common regressors; more can be added later
-    from sklearn.linear_model import (
-        LinearRegression,
-        Ridge,
-        Lasso,
-        ElasticNet,
-        BayesianRidge,
-        HuberRegressor,
-        RANSACRegressor,
-    )
-    from sklearn.svm import SVR
-    from sklearn.tree import DecisionTreeRegressor
-    from sklearn.ensemble import (
-        RandomForestRegressor,
-        GradientBoostingRegressor,
-    )
-    from sklearn.neighbors import KNeighborsRegressor
-    from sklearn.neural_network import MLPRegressor
-
-    # registry mapping short names to constructors
-    DEFAULT_REGRESSORS = {
-        "linear": LinearRegression,
-        "ridge": Ridge,
-        "lasso": Lasso,
-        "elasticnet": ElasticNet,
-        "bayesian_ridge": BayesianRidge,
-        "huber": HuberRegressor,
-        "ransac": RANSACRegressor,
-        "svr": SVR,
-        "decision_tree": DecisionTreeRegressor,
-        "random_forest": RandomForestRegressor,
-        "gradient_boosting": GradientBoostingRegressor,
-        "knn": KNeighborsRegressor,
-        "mlp": MLPRegressor,
-    }
-except ImportError:
-    # scikit-learn is an optional dependency; functions will raise if used without it
-    BaseEstimator = None  # type: ignore
-    DEFAULT_REGRESSORS = {}
-
-
-def distance_matrix_from_keypoints(
-    keypoints_list: Sequence[np.ndarray]
-) -> np.ndarray:
-    """Convert a sequence of keypoint arrays into a distance matrix.
-
-    Each element of ``keypoints_list`` should be an ``(N,2)`` array.  The
-    returned matrix has shape ``(num_samples, N-1)`` where each row contains the
-    sequential distances for that sample.  This is just a convenience wrapper
-    around :func:`~utils.validation.helpers.sequential_distances`.
-    """
-    from .helpers import sequential_distances
-
-    return np.vstack([sequential_distances(kp) for kp in keypoints_list])
-
-
-def train_distance_models(
-    distance_matrix: np.ndarray,
-    model_factory: Union[Callable[[], BaseEstimator], str] = "linear",
-    exclude_endpoints: bool = False,
-) -> List[BaseEstimator]:
-    """Train regression models predicting one distance from the others.
-
-    The idea is to take a dataset of sequential distances (e.g. produced by
-    ``sequential_distances``) and build a separate scikit-learn regressor for
-    each index.  Each model receives all of the distances *except* the one it
-    is predicting as input features.
-
-    Args:
-        distance_matrix: array of shape ``(num_samples, num_distances)`` where
-            ``num_distances == N-1`` when ``N`` is the number of keypoints.  Each
-            row contains the sequential distances for a single example.
-        model_factory: either a callable returning a fresh, unfitted estimator
-            or a string key referring to one of the built-in regressors.  The
-            following names are recognised by default:
-
-                {}
-
-            You can also supply a custom factory if you prefer.
-        exclude_endpoints: if ``True`` the first and last distances are ignored
-            when building models.  This results in ``num_distances - 2``
-            regressors, which is the behaviour requested by the user (predicting
-            an interior distance from the others).  Set to ``False`` to obtain a
-            model for every distance.
-
-    Returns:
-        A list of fitted estimators.  When ``exclude_endpoints`` is ``True`` the
-        ``i``‑th element of the returned list corresponds to original
-        ``distance_matrix`` column ``i+1`` (i.e. the second sequential distance).
-    """.format(
-        ", ".join(sorted(DEFAULT_REGRESSORS.keys()))
-    )
-    if BaseEstimator is None:
-        raise ImportError("scikit-learn is required for training distance models")
-
-    # resolve string names to constructors
-    if isinstance(model_factory, str):
-        key = model_factory.lower()
-        if key not in DEFAULT_REGRESSORS:
-            raise ValueError(f"unknown regressor '{model_factory}'; valid options are: {', '.join(DEFAULT_REGRESSORS.keys())}")
-        model_factory = DEFAULT_REGRESSORS[key]
-
-    distance_matrix = np.asarray(distance_matrix)
-    if distance_matrix.ndim != 2:
-        raise ValueError(f"distance_matrix must be 2‑D (samples x distances), in this case {distance_matrix.ndim}‑D was given")
-
-    num_samples, num_distances = distance_matrix.shape
-    if num_samples < 2:
-        raise ValueError("At least two samples are required to train models")
-
-    models: List[BaseEstimator] = []
-    # determine which indices to build models for
-    indices = list(range(num_distances))
-    if exclude_endpoints:
-        if num_distances < 3:
-            # nothing to train if there are fewer than three distances
-            return []
-        indices = list(range(1, num_distances - 1))
-
-    for idx in indices:
-        X = np.delete(distance_matrix, idx, axis=1)
-        y = distance_matrix[:, idx]
-        model = model_factory()
-        # fit and append
-        model.fit(X, y)
-        models.append(model)
-
-    return models
-
-
-def predict_distances(
-    models: Sequence[BaseEstimator],
-    distances: Union[np.ndarray, Sequence[np.ndarray]],
-    exclude_endpoints: bool = False,
-) -> np.ndarray:
-    """Use previously trained regressors to predict distances.
-
-    The ``models`` sequence must have been produced by
-    :func:`train_distance_models` with the same ``exclude_endpoints`` flag.
-
-    Args:
-        models: sequence of fitted estimators.
-        distances: single vector (shape ``(num_distances,)``) or matrix of
-            vectors (shape ``(samples, num_distances)``) containing the known
-            distances.
-        exclude_endpoints: same semantics as in :func:`train_distance_models`.
-
-    Returns:
-        Array of shape ``(samples, len(models))`` containing predictions for the
-        requested distances.  The order of columns corresponds to the order the
-        models were trained (see documentation of
-        :func:`train_distance_models`).
-    """
-    if BaseEstimator is None:
-        raise ImportError("scikit-learn is required for predicting distances")
-
-    arr = np.asarray(distances)
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    if arr.ndim != 2:
-        raise ValueError("distances must be a 1‑ or 2‑D array")
-
-    num_samples, num_distances = arr.shape
-    # figure out which columns were targets during training
-    indices = list(range(num_distances))
-    if exclude_endpoints:
-        indices = list(range(1, num_distances - 1))
-
-    if len(models) != len(indices):
-        raise ValueError("number of models does not match expected number of distances")
-
-    preds = []
-    for model, idx in zip(models, indices):
-        X = np.delete(arr, idx, axis=1)
-        preds.append(model.predict(X))
-
-    return np.column_stack(preds)
-
-
-def create_prediction_report(
-    predictions: np.ndarray,
-    labels: np.ndarray,
-    sample_ids: List[str] = None,
-    metric: str = "mae"
-) -> List[Dict[str, Any]]:
-    """Create a sorted report comparing predictions with labels.
-
-    Calculates error metrics per sample, sorts by error (descending),
-    and returns a list of dictionaries with sample info and errors.
-
-    Args:
-        predictions: Array of shape (num_samples, num_targets) with predicted values
-        labels: Array of shape (num_samples, num_targets) with true values
-        sample_ids: Optional list of sample identifiers (e.g. image paths).
-                    If None, uses 0-indexed sample numbers.
-        metric: Error metric to sort by. Options:
-                - "mae": mean absolute error per sample
-                - "mse": mean squared error per sample
-                - "rmse": root mean squared error per sample
-                - "max": maximum absolute error per sample
-
-    Returns:
-        List of dictionaries, sorted by error (descending). Each dict contains:
-            - "rank": ranking (1 = highest error)
-            - "sample_id": identifier for the sample
-            - "error": computed error value
-            - "predictions": predicted values
-            - "labels": true values
-            - "differences": predictions - labels
-    """
-    predictions = np.asarray(predictions)
-    labels = np.asarray(labels)
-
-    if predictions.shape != labels.shape:
-        raise ValueError(f"predictions and labels must have same shape; got {predictions.shape} vs {labels.shape}")
-
-    num_samples = predictions.shape[0]
-
-    if sample_ids is None:
-        sample_ids = [str(i) for i in range(num_samples)]
-    elif len(sample_ids) != num_samples:
-        raise ValueError(f"sample_ids length ({len(sample_ids)}) does not match predictions ({num_samples})")
-
-    # Calculate errors
-    diffs = predictions - labels
-    abs_diffs = np.abs(diffs)
-
-    if metric.lower() == "mae":
-        errors = np.mean(abs_diffs, axis=1)
-    elif metric.lower() == "mse":
-        errors = np.mean(diffs ** 2, axis=1)
-    elif metric.lower() == "rmse":
-        errors = np.sqrt(np.mean(diffs ** 2, axis=1))
-    elif metric.lower() == "max":
-        errors = np.max(abs_diffs, axis=1)
-    else:
-        raise ValueError(f"unknown metric '{metric}'; options: mae, mse, rmse, max")
-
-    # Sort descending by error
-    sorted_indices = np.argsort(-errors)
-
-    report = []
-    for rank, idx in enumerate(sorted_indices, start=1):
-        report.append({
-            "rank": rank,
-            "sample_id": sample_ids[idx],
-            "error": float(errors[idx]),
-            "predictions": predictions[idx].tolist(),
-            "labels": labels[idx].tolist(),
-            "differences": diffs[idx].tolist(),
-        })
-
-    return report

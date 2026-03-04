@@ -91,12 +91,13 @@ print(MODEL_REGISTRY["custom"])  # custom: None (provide path dynamically)
 
 ### ✅ `utils/validation/`
 
-Image validation, duplicate detection, and model evaluation.
+Image validation, LBP feature extraction, and analysis.
 
-| Submodule | Purpose | Main Functions |
+| Submodule | Purpose | Main Classes/Functions |
 |-----------|---------|-----------------|
-| `helpers.py` | Keypoint utilities | `load_keypoints()`, `sequential_distances()`, `draw_keypoints()` |
-| `duplicates.py` | CLIP embeddings & duplicate detection | `generate_clip_embeddings()`, `find_near_duplicates()` |
+| `helpers.py` | Keypoint utilities | `load_keypoints()`, `draw_keypoints()` |
+| `image_validation.py` | Per-image LBP analysis | `YPImageValidation` class |
+| `set_validation.py` | Dataset-level analysis | `YPSetValidation` class |
 | `analysis.py` | Group analysis & reporting | `generate_group_visualizations()`, `save_groups_analysis()`, `export_groups_analysis_to_excel()` |
 | `evaluation.py` | LBP feature extraction & dataset handling | `YOLOPoseDataset` class with `get_all_lbp_histograms()`, `get_all_lbp_decimals()`, `apply_function_to_all()` |
 

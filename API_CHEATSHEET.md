@@ -1,103 +1,304 @@
 # API Cheat Sheet
 
-Quick reference for all functions in the `utils` package.
+Quick reference for all classes and functions in the `utils` package.
 
 ---
 
-## NEW: LBP Feature Extraction
-
-### YOLOPoseDataset Class
+## YPImageValidation - Per-Image LBP Feature Extraction
 
 ```python
-from utils.validation import YOLOPoseDataset
+from utils.validation import YPImageValidation
+import cv2
+import numpy as np
 
-# Load dataset (supports data.yaml, train.txt, args.yaml)
-dataset = YOLOPoseDataset("data.yaml")
+# Initialize with image and keypoints
+image = cv2.imread("image.jpg", cv2.IMREAD_GRAYSCALE)
+keypoints = np.array([[100, 50], [150, 200]])  # (N, 2)
 
-# Get statistics
-print(dataset.stats)  # Total images, keypoints, paths
+validator = YPImageValidation(image, keypoints)
 
-# Get all LBP histograms (fastest - one command)
-histograms, counts, paths = dataset.get_all_lbp_histograms(patch_size=5)
-# Returns: (total_keypoints, 256) float32 array
+# Get LBP features for all keypoints
+histograms = validator.compute_lbp_histograms(patch_size=5)      # (N, 256)
+decimals = validator.compute_lbp_decimals(patch_size=7)          # (N,)
 
-# Get binary decimal representation
-decimals, counts, paths = dataset.get_all_lbp_decimals(patch_size=7)
-# Returns: (total_keypoints,) uint64 array
+# Single keypoint LBP
+single_hist = validator.compute_lbp_histogram_single(100, 50)    # (256,)
+single_decimal = validator.compute_lbp_decimal_single(100, 50)   # scalar
 
-# Iterate with LBP features
-for sample in dataset.iterate_with_lbp(patch_size=5):
-    image = sample['image']              # numpy array
-    keypoints = sample['keypoints']     # (N, 2)
-    hist = sample['lbp_histogram']      # (N, 256)
-    decimal = sample['lbp_decimal']      # (N,)
+# Distance between keypoints
+distances = validator.sequential_distances(visibility_threshold=0.5)  # (N-1,)
 
-# Get single sample with features
-sample = dataset.get_sample_with_features(idx=0, patch_size=5)
-
-# Create pandas DataFrame with all features
-df = dataset.create_dataframe(patch_size=5)
-df.to_csv("features.csv")
-
-# Apply custom function to all samples
-results = dataset.apply_function_to_all(my_function, arg1=value1)
-
-# Visualize sample with keypoints and patches
-image = dataset.visualize_sample(idx=0, patch_size=5)
-cv2.imshow("Sample", image)
+# Visualize
+result = validator.visualize(patch_size=5)
 ```
 
-### LBP Functions
+**All Methods:**
+- `__init__(image, keypoints)`
+- `compute_lbp_histograms(patch_size)` → (N, 256)
+- `compute_lbp_decimals(patch_size)` → (N,)
+- `compute_lbp_histogram_single(x, y, patch_size)` → (256,)
+- `compute_lbp_decimal_single(x, y, patch_size)` → scalar
+- `sequential_distances(visibility_threshold)` → (N-1,)
+- `visualize(patch_size)` → numpy array
+
+---
+
+## YOLOPoseDataset - Dataset Management
+
+```python
+from utils.datasets import YOLOPoseDataset
+
+# Load dataset from data.yaml, train.txt, or args.yaml
+dataset = YOLOPoseDataset("data.yaml")
+
+# Iterate through samples
+for sample in dataset:
+    image = sample['image']          # numpy array
+    keypoints = sample['keypoints']  # (N, 2) or (N, 3)
+    image_path = sample['image_path']
+    label_path = sample['label_path']
+
+# Get specific sample
+sample = dataset[0]
+
+# Get dataset info
+print(len(dataset))           # Total images
+print(dataset.get_stats())    # Statistics
+print(dataset.get_image_paths())   # All image paths
+```
+
+**Constructor:**
+- `YOLOPoseDataset(dataset_path, include_visibility=True)`
+  - dataset_path: Path to data.yaml, train.txt, or args.yaml
+
+**Methods:**
+- `__len__()` → Total number of images
+- `__getitem__(idx)` → Get single sample
+- `__iter__()` → Iterate through samples
+- `get_stats()` → Dataset statistics
+- `get_image_paths()` → All image paths
+- `get_label_paths()` → All label paths
+
+---
+
+## YOLOPoseImage - Single Image
+
+```python
+from utils.datasets import YOLOPoseImage
+
+# Load single image with its label
+yolo_image = YOLOPoseImage("path/to/image.jpg", "path/to/image.txt")
+
+# Access data
+print(yolo_image.image)         # numpy array
+print(yolo_image.keypoints)     # (N, 2) or (N, 3)
+print(yolo_image.image_path)
+print(yolo_image.label_path)
+```
+
+---
+
+## YPSetValidation - Dataset Feature Extraction
+
+```python
+from utils.validation import YPSetValidation
+from utils.datasets import YOLOPoseDataset
+
+# Create from YOLOPoseDataset
+dataset = YOLOPoseDataset("data.yaml")
+validator = YPSetValidation.from_yolo_dataset(dataset, patch_size=5)
+
+# Extract all LBP features
+histograms = validator.get_all_lbp_histograms()  # (total_keypoints, 256)
+decimals = validator.get_all_lbp_decimals()      # (total_keypoints,)
+
+# Export to DataFrame
+df = validator.create_dataframe()
+df.to_csv("features.csv")
+```
+
+**Methods:**
+- `from_yolo_dataset(dataset, patch_size)` → YPSetValidation
+- `get_all_lbp_histograms()` → (total_keypoints, 256)
+- `get_all_lbp_decimals()` → (total_keypoints,)
+- `create_dataframe()` → pandas.DataFrame
+
+---
+
+## Helpers - Keypoint Utilities
+
+```python
+from utils.validation import YPImageValidation
+import cv2
+
+# Load keypoints from YOLO label file
+keypoints = YPImageValidation.load_keypoints("labels/image.txt")  # (N, 2)
+
+# Draw keypoints on image
+image = cv2.imread("image.jpg")
+marked = YPImageValidation.draw_keypoints_on_image(image, keypoints, color=(0, 255, 0))
+cv2.imwrite("marked.jpg", marked)
+
+# Calculate distances
+distances = YPImageValidation.compute_sequential_distances(keypoints)  # (N-1,)
+```
+
+**Static Functions:**
+- `load_keypoints(label_path)` → (N, 2)
+- `draw_keypoints_on_image(image, keypoints, color)` → marked image
+- `compute_sequential_distances(keypoints, visibility_threshold)` → distances
+
+---
+
+## Analysis Module - Group Operations
 
 ```python
 from utils.validation import (
-    compute_lbp_for_image,
-    compute_lbp_binary_decimal,
-    compute_lbp_histogram,
-    compute_lbp_value,
-    patch_to_binary_decimal,
+    generate_group_visualizations,
+    save_groups_analysis,
+    analyze_hidden_keypoints,
+    export_groups_analysis_to_excel
 )
 
-# Use with YOLOPoseDataset
-dataset = YOLOPoseDataset("train.txt")
+# Visualize groups
+generate_group_visualizations(
+    groups=[[0, 5, 10], [1, 6]],
+    filenames=filenames,
+    image_folder="./images",
+    label_folder="./labels",
+    output_folder="./visualizations"
+)
 
-# Process entire image
-for sample in dataset:
-    # Get LBP histogram for all keypoints
-    hist = compute_lbp_for_image(
-        sample['image'],         # numpy array or path
-        sample['keypoints'],     # (N, 2)
-        patch_size=5
-    )  # Returns: (N, 256)
-    
-    # Get binary decimal representation
-    decimals = compute_lbp_binary_decimal(
-        sample['image'],
-        sample['keypoints'],
-        patch_size=7
-    )  # Returns: (N,) uint64
+# Save JSON analysis
+save_groups_analysis(
+    groups=groups,
+    filenames=filenames,
+    label_folder="./labels",
+    output_json="analysis.json"
+)
 
-# Process single keypoint
-sample = dataset[0]
-x, y = sample['keypoints'][0]
-hist = compute_lbp_histogram(sample['image'], int(x), int(y), patch_size=5)
-# Returns: (256,) single histogram
+# Analyze hidden keypoints
+analyze_hidden_keypoints(
+    label_folder="./labels",
+    output_json="hidden.json"
+)
 
-# Low-level: compute LBP for single neighborhood
-neighborhood = sample['image'][y-1:y+2, x-1:x+2]  # 3x3 patch
-lbp_value = compute_lbp_value(neighborhood)  # Returns: 0-255
-
-# Convert patch to binary/decimal
-patch = sample['image'][y-7:y+8, x-7:x+8]  # 15x15 patch
-result = patch_to_binary_decimal(patch)
-# result = {
-#     'binary': array([0, 1, 0, ...]),  # Flattened binary
-#     'decimal': 12345678,              # Single decimal number
-#     'shape': (15, 15)
-# }
+# Export Excel report
+export_groups_analysis_to_excel(
+    json_path="analysis.json",
+    output_path="report.xlsx"
+)
 ```
 
 ---
+
+## Dataset Operations
+
+```python
+from utils.datasets import (
+    flatten_cvat_yolo_pose,
+    merge_yolo_pose_datasets,
+    split_yolo_pose_dataset,
+    convert_yolo_pose_to_cvat,
+    extract_image_subset
+)
+
+# Flatten CVAT structure
+flatten_cvat_yolo_pose(
+    input_root="./raw",
+    output_root="./flat"
+)
+
+# Merge datasets
+merge_yolo_pose_datasets(
+    dataset1_root="./dataset1",
+    dataset2_root="./dataset2",
+    output_root="./merged"
+)
+
+# Split into train/val
+split_yolo_pose_dataset(
+    dataset_root="./data",
+    output_root="./split",
+    val_ratio=0.2,
+    seed=42
+)
+
+# Convert to CVAT
+convert_yolo_pose_to_cvat(
+    dataset_root="./data",
+    output_zip_dir="./cvat_export"
+)
+
+# Extract image range
+extract_image_subset(
+    images_path="./images",
+    output_dir="./subset",
+    a=100,
+    b=200
+)
+```
+
+---
+
+## Common Patterns
+
+### Pattern 1: Load Dataset and Extract LBP Features
+
+```python
+from utils.datasets import YOLOPoseDataset
+from utils.validation import YPSetValidation
+
+dataset = YOLOPoseDataset("data.yaml")
+validator = YPSetValidation.from_yolo_dataset(dataset, patch_size=5)
+features = validator.get_all_lbp_histograms()
+print(f"Shape: {features.shape}")  # (total_keypoints, 256)
+```
+
+### Pattern 2: Per-Image Analysis
+
+```python
+from utils.datasets import YOLOPoseImage
+from utils.validation import YPImageValidation
+
+img = YOLOPoseImage("image.jpg", "image.txt")
+validator = YPImageValidation(img.image, img.keypoints)
+hist = validator.compute_lbp_histograms(patch_size=5)
+distances = validator.sequential_distances()
+```
+
+### Pattern 3: Batch Processing
+
+```python
+from utils.datasets import YOLOPoseDataset
+from utils.validation import YPImageValidation
+
+dataset = YOLOPoseDataset("data.yaml")
+for sample in dataset:
+    validator = YPImageValidation(sample['image'], sample['keypoints'])
+    features = validator.compute_lbp_histograms(patch_size=5)
+    # Process features...
+```
+
+---
+
+## Configuration
+
+```python
+from utils.config import MODEL_REGISTRY, VALID_IMAGE_EXTENSIONS
+
+# View registered models
+print(MODEL_REGISTRY)
+
+# Valid image formats
+print(VALID_IMAGE_EXTENSIONS)
+
+# Default thresholds
+from utils.config import (
+    DEFAULT_THRESHOLD_SIMILARITY,
+    DEFAULT_THRESHOLD_DUPLICATES
+)
+```
 
 ## Validation Module
 

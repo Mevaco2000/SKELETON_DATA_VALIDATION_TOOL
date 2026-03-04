@@ -3,7 +3,7 @@ Name: utils-yolo-validation
 Version: 0.1.0
 Summary: Professional toolkit for YOLO pose dataset validation, analysis, and manipulation
 Home-page: https://github.com/example/utils-yolo-validation
-Author: Data Validation Team
+Author: Rafał Wysocki, PUT
 License: Proprietary
 Project-URL: Homepage, https://github.com/example/utils-yolo-validation
 Project-URL: Documentation, https://github.com/example/utils-yolo-validation/blob/main/README.md
@@ -146,10 +146,24 @@ Handles image validation, duplicate detection, and model evaluation.
 - `analyze_hidden_keypoints()` — Analyze hidden/invalid keypoints
 - `export_groups_analysis_to_excel()` — Export statistics to Excel
 
-**evaluation.py** — YOLO model training & evaluation
-- `train_yolo_pose_model()` — Train YOLO pose models
-- `load_yolo_pose_label()` — Load labels as keypoint arrays
-- `evaluate_model_on_dataset()` — Generate detailed error reports
+**evaluation.py** — LBP Feature Extraction & Dataset Management
+- `YOLOPoseDataset` — Class for loading and processing YOLO Pose datasets with flexible LBP computation
+  - Supports data.yaml, args.yaml, and train.txt inputs
+  - Auto-detects train/val/test splits from data.yaml
+  - Iterator interface for samples (image + keypoints)
+  - Methods: `get_all_lbp_histograms()`, `get_all_lbp_decimals()`, `iterate_with_lbp()`, `apply_function_to_all()`
+  - Creates pandas DataFrames with features
+  - Visualizes samples with keypoints and patches
+- LBP Core Functions (Local Binary Pattern analysis):
+  - `compute_lbp_value()` — Compute LBP for single 3x3 neighborhood
+  - `compute_lbp_histogram()` — Compute LBP histogram for single keypoint
+  - `compute_lbp_for_image()` — Compute LBP for all keypoints in image
+  - `compute_lbp_for_keypoints()` — Alias for `compute_lbp_for_image()`
+  - `compute_lbp_binary_decimal()` — Binary decimal representation of patches
+  - `patch_to_binary_decimal()` — Convert patch to binary/decimal
+- Variable radius LBP (circular sampling):
+  - `compute_lbp_value_variable_radius()` — Circular LBP sampling
+  - `compute_lbp_histogram_variable_radius()` — Variable radius histograms
 
 ---
 
@@ -194,13 +208,11 @@ Models are registered in `utils/config.py`:
 
 ```python
 MODEL_REGISTRY = {
-    "nano": "models_for_analysis/yolo11n-pose.pt",
-    "small": "models_for_analysis/yolo11s-pose.pt",
-    "custom": None,  # Provide path dynamically
+    "custom": None,  # path will be provided dynamically
 }
 ```
 
-Add custom models by modifying the registry or providing path directly to `train_yolo_pose_model()`.
+Provide custom models directly to `train_yolo_pose_model()`.
 
 ### CLIP Settings
 
@@ -222,9 +234,88 @@ DEFAULT_THRESHOLD_DUPLICATES = 0.99    # Find near-duplicates
 
 ---
 
+## NEW: LBP Feature Extraction
+
+### YOLOPoseDataset Class
+
+Unified interface for loading and processing YOLO Pose datasets with optional LBP computation.
+
+**Key Features:**
+- Loads images + keypoints from YOLO format datasets
+- Supports multiple input formats: `data.yaml`, `train.txt`, `args.yaml`
+- Auto-detects train/val/test splits from `data.yaml`
+- Flexible feature computation: LBP histograms or binary decimals
+- Iterator interface for memory-efficient batch processing
+- Converts to pandas DataFrames for analysis
+- Visualizes samples with keypoints and patches
+
+**Quick Example:**
+
+```python
+from utils.validation import YOLOPoseDataset
+
+# Load dataset (auto-detects split from data.yaml)
+dataset = YOLOPoseDataset("path/to/data.yaml")
+
+# Get basic stats
+print(dataset.stats)  # Total images, keypoints, etc.
+
+# Get all LBP histograms in ONE COMMAND
+histograms, counts, paths = dataset.get_all_lbp_histograms(patch_size=5)
+# Returns: (total_keypoints, 256) histogram array
+
+# Or iterate with LBP features
+for sample in dataset.iterate_with_lbp(patch_size=5):
+    hist = sample['lbp_histogram']  # (N, 256)
+    decimal = sample['lbp_decimal']  # (N,)
+    
+# Use standalone functions with dataset
+from utils.validation import compute_lbp_for_image
+for sample in dataset:
+    hist = compute_lbp_for_image(
+        sample['image'],
+        sample['keypoints'],
+        patch_size=5
+    )
+```
+
+---
+
 ## Usage Examples
 
-### Example 1: Detect and Remove Duplicate Images
+### Example 6: LBP Feature Extraction from Dataset
+
+```python
+from utils.validation import YOLOPoseDataset
+
+# Initialize dataset from data.yaml
+dataset = YOLOPoseDataset("./data/data.yaml")
+
+# Method 1: Get all LBP histograms at once (fastest)
+histograms, counts, paths = dataset.get_all_lbp_histograms(patch_size=5)
+print(f"Extracted {histograms.shape[0]} keypoint histograms")
+
+# Method 2: Get binary decimal representation (alternative feature)
+decimals, counts, paths = dataset.get_all_lbp_decimals(patch_size=7)
+print(f"Binary decimals: {decimals.shape} dtype: {decimals.dtype}")
+
+# Method 3: Create pandas DataFrame with all features
+df = dataset.create_dataframe(patch_size=5)
+df.to_csv("lbp_features.csv")  # Export for analysis
+
+# Method 4: Iterate with custom feature extraction
+def custom_feature(sample, patch_size=5):
+    from utils.validation import compute_lbp_for_image
+    return compute_lbp_for_image(
+        sample['image'],
+        sample['keypoints'],
+        patch_size
+    )
+
+features = dataset.apply_function_to_all(custom_feature, patch_size=7)
+```
+
+---
 
 ```python
 from utils import generate_clip_embeddings, find_near_duplicates, extract_image_subset
@@ -261,7 +352,7 @@ from utils import train_yolo_pose_model, evaluate_model_on_dataset
 
 # Train model
 model = train_yolo_pose_model(
-    model_key="small",
+    model_key="custom\",              # or provide path directly
     dataset_yaml_path="./data/data.yaml",
     epochs=50,
     imgsz=640,
@@ -451,7 +542,7 @@ Export group statistics to Excel with mean calculations.
 #### `train_yolo_pose_model(...) → YOLO`
 Train YOLO pose model on dataset.
 - **Args:**
-  - `model_key` — "nano", "small", or "custom"
+  - `model_key` — \"custom\" (or provide custom path)
   - `dataset_yaml_path` — Path to data.yaml
   - `epochs` — Training epochs (default: 100)
   - `batch` — Batch size (default: 16)
