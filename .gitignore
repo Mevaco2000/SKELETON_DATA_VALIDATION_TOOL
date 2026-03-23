@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+
+# Data / outputs
+*.zip
+filtered_images_3.zip
+runs/
+
+# Notebooks (osobne repo)
+weryfikacje/
+
+# Package uploads
+utils/uploaded/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,7 +1,7 @@
 """YOLO Pose dataset loading and management."""
 
 import os
-from typing import Union, Dict, Any
+from typing import Union, Dict, Any, List, Optional, Sequence, Tuple
 import numpy as np
 import cv2
 from dataclasses import dataclass
@@ -14,10 +14,53 @@ class YOLOSample:
     keypoints: np.ndarray
     image_path: str
     label_path: str
+    all_keypoints: List[np.ndarray]
+    person_count: int
     
     def __getitem__(self, key):
         """Allow dict-like access for backward compatibility."""
         return getattr(self, key)
+
+    def get(self, key, default=None):
+        """Allow dict-like get access for backward compatibility."""
+        return getattr(self, key, default)
+
+
+def _first_person_keypoints(all_keypoints: List[np.ndarray]) -> np.ndarray:
+    """Return first person's keypoints for backward-compatible single-person APIs."""
+    return all_keypoints[0] if all_keypoints else np.array([])
+
+
+def _candidate_label_paths(image_rel_path: str, labels_dir: str) -> List[str]:
+    """Return likely label paths for an image relative path.
+
+    Supports both flat ``labels/<name>.txt`` datasets and mirrored layouts like
+    ``images/train/foo.jpg`` -> ``labels/train/foo.txt``.
+    """
+    normalized_rel_path = image_rel_path.replace('\\', '/')
+    rel_path_without_ext = os.path.splitext(normalized_rel_path)[0]
+    rel_parts = [part for part in rel_path_without_ext.split('/') if part]
+
+    candidate_paths = [
+        os.path.join(labels_dir, os.path.basename(rel_path_without_ext) + '.txt'),
+    ]
+
+    if rel_parts:
+        mirrored_parts = rel_parts[1:] if rel_parts[0].lower() == 'images' else rel_parts
+        if mirrored_parts:
+            candidate_paths.append(os.path.join(labels_dir, *mirrored_parts) + '.txt')
+
+    # Preserve order while removing duplicates.
+    seen_paths = set()
+    unique_paths = []
+    for candidate_path in candidate_paths:
+        normalized_path = os.path.abspath(candidate_path)
+        if normalized_path in seen_paths:
+            continue
+        seen_paths.add(normalized_path)
+        unique_paths.append(normalized_path)
+
+    return unique_paths
 
 
 class YOLOPoseImage:
@@ -47,7 +90,7 @@ class YOLOPoseImage:
         >>> from utils.validation import YPImageValidation
         >>> yolo_img = YOLOPoseImage("image.jpg", "image.txt")
         >>> validator = YPImageValidation(yolo_img.image, yolo_img.keypoints)
-        >>> hist = validator.compute_lbp_histograms(patch_size=5)
+        >>> decimals = validator.compute_lbp_decimals(patch_size=5)
         >>> distances = validator.sequential_distances(visibility_threshold=0.5)
     
     Example 3 - Get as dict (compatible with YOLOPoseDataset):
@@ -58,7 +101,7 @@ class YOLOPoseImage:
     """
     
     def __init__(self, image_path: Union[str, np.ndarray], label_path: str = None, 
-                 include_visibility: bool = True):
+                 include_visibility: bool = True, keypoint_format: str = 'auto'):
         """
         Initialize YOLOPoseImage.
         
@@ -68,6 +111,7 @@ class YOLOPoseImage:
                        If None and image_path is str, infers label_path from image path.
             include_visibility: If True, load visibility scores as 3rd dimension.
                               If False, load only [x, y] coordinates.
+            keypoint_format: One of ``'auto'``, ``'xy'``, or ``'xyv'``.
         
         Raises:
             FileNotFoundError: If image or label file doesn't exist
@@ -92,23 +136,38 @@ class YOLOPoseImage:
         if label_path is None:
             if self.image_path is None:
                 raise ValueError("label_path required when image_path is numpy array")
-            # Infer label path from image path
-            img_name = os.path.splitext(self.image_name)[0]
-            img_dir = os.path.dirname(self.image_path)
-            label_path = os.path.join(img_dir, '..', 'labels', img_name + '.txt')
+            # Infer label path from image path, supporting mirrored labels/train/... layouts.
+            image_dir = os.path.dirname(self.image_path)
+            image_root = image_dir
+            while os.path.basename(image_root).lower() != 'images':
+                parent_dir = os.path.dirname(image_root)
+                if parent_dir == image_root:
+                    break
+                image_root = parent_dir
+
+            if os.path.basename(image_root).lower() == 'images':
+                dataset_root = os.path.dirname(image_root)
+                image_rel_path = os.path.relpath(self.image_path, dataset_root)
+                label_candidates = _candidate_label_paths(image_rel_path, os.path.join(dataset_root, 'labels'))
+                label_path = label_candidates[0]
+            else:
+                img_name = os.path.splitext(self.image_name)[0]
+                label_path = os.path.join(image_dir, '..', 'labels', img_name + '.txt')
         
         self.label_path = os.path.abspath(label_path)
         if not os.path.exists(self.label_path):
             raise FileNotFoundError(f"Label file not found: {self.label_path}")
         
         self.label_name = os.path.basename(self.label_path)
+        self.keypoint_format = keypoint_format
         
         # Load keypoints from label file
         self._load_keypoints(include_visibility)
     
     @classmethod
     def from_yaml_index(cls, data_yaml: str, index: int, split: str = 'train',
-                       include_visibility: bool = True) -> 'YOLOPoseImage':
+                       include_visibility: bool = True,
+                       keypoint_format: str = 'auto') -> 'YOLOPoseImage':
         """
         Load image by index from a data.yaml config.
         
@@ -117,6 +176,7 @@ class YOLOPoseImage:
             index: Index of image in the split
             split: Which split to load ('train', 'val', 'test'). Default 'train'.
             include_visibility: If True, load visibility scores as 3rd dimension.
+            keypoint_format: One of ``'auto'``, ``'xy'``, or ``'xyv'``.
             
         Returns:
             YOLOPoseImage instance
@@ -129,18 +189,20 @@ class YOLOPoseImage:
             >>> img = YOLOPoseImage.from_dataset_index("data.yaml", index=0, split="train")
             >>> distances = img.get_sequential_distances()
         """
-        dataset = YOLOPoseDataset(data_yaml)
+        dataset = YOLOPoseDataset(data_yaml, keypoint_format=keypoint_format)
         sample = dataset[index]
         
         return cls(
             image_path=sample['image_path'],
             label_path=sample['label_path'],
-            include_visibility=include_visibility
+            include_visibility=include_visibility,
+            keypoint_format=keypoint_format,
         )
     
     @classmethod
     def from_txt_index(cls, file_list_path: str, index: int, labels_dir: str = None,
-                      include_visibility: bool = True) -> 'YOLOPoseImage':
+                      include_visibility: bool = True,
+                      keypoint_format: str = 'auto') -> 'YOLOPoseImage':
         """
         Load image by index from a file list (train.txt, val.txt, etc.).
         
@@ -150,6 +212,7 @@ class YOLOPoseImage:
             labels_dir: Path to labels directory. If None, inferred from file_list_path parent.
                        Defaults to: os.path.dirname(file_list_path)/../labels/
             include_visibility: If True, load visibility scores as 3rd dimension.
+            keypoint_format: One of ``'auto'``, ``'xy'``, or ``'xyv'``.
             
         Returns:
             YOLOPoseImage instance
@@ -165,19 +228,26 @@ class YOLOPoseImage:
             >>> # From val.txt with custom labels directory
             >>> img = YOLOPoseImage.from_file_index("val.txt", 0, labels_dir="custom/labels")
         """
-        dataset = YOLOPoseDataset(file_list_path, labels_dir=labels_dir)
+        dataset = YOLOPoseDataset(file_list_path, labels_dir=labels_dir, keypoint_format=keypoint_format)
         sample = dataset[index]
         
         return cls(
             image_path=sample['image_path'],
             label_path=sample['label_path'],
-            include_visibility=include_visibility
+            include_visibility=include_visibility,
+            keypoint_format=keypoint_format,
         )
     
     def _load_keypoints(self, include_visibility: bool = True):
         """Load keypoints from label file."""
-        from ..validation.helpers import load_keypoints
-        self.keypoints = load_keypoints(self.label_path, include_visibility=include_visibility)
+        from ..validation.image_validation import YPImageValidation
+        self.all_keypoints = YPImageValidation.load_all_keypoints_from_file(
+            self.label_path,
+            include_visibility=include_visibility,
+            keypoint_format=self.keypoint_format,
+        )
+        self.person_count = len(self.all_keypoints)
+        self.keypoints = _first_person_keypoints(self.all_keypoints)
     
     @property
     def num_keypoints(self) -> int:
@@ -194,17 +264,22 @@ class YOLOPoseImage:
         """Check if keypoints include visibility scores."""
         return self.keypoints.shape[1] >= 3
     
-    def get_sequential_distances(self, visibility_threshold: float = 0.5) -> np.ndarray:
+    def get_sequential_distances(
+        self,
+        visibility_threshold: float = 2.0,
+        distance_connections: Optional[Sequence[Tuple[int, int]]] = None,
+    ) -> np.ndarray:
         """
-        Get sequential distances between consecutive visible keypoints.
+        Get distances between visible keypoint pairs.
         
-        Computes Euclidean distances from keypoint[i] to keypoint[i+1] for 
-        consecutive visible pairs. Skips distances involving hidden/occluded 
-        keypoints (visibility < threshold).
+        By default computes consecutive distances. When ``distance_connections``
+        is provided, computes distances for that explicit ordered list of pairs.
         
         Args:
-            visibility_threshold: Minimum visibility score (0-1) to consider a keypoint visible.
-                                Default 0.5. Keypoints below this are skipped.
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                                Default 2.0 (only fully visible keypoints).
+            distance_connections: Optional ordered list of ``(start_idx, end_idx)``
+                                keypoint pairs to measure instead of consecutive pairs.
         
         Returns:
             Array of distances between consecutive visible keypoints.
@@ -218,7 +293,24 @@ class YOLOPoseImage:
         """
         from ..validation.image_validation import YPImageValidation
         validator = YPImageValidation(self.image, self.keypoints)
-        return validator.sequential_distances(visibility_threshold=visibility_threshold)
+        return validator.sequential_distances(
+            visibility_threshold=visibility_threshold,
+            distance_connections=distance_connections,
+        )
+
+    def get_sequential_angles(self, visibility_threshold: float = 2.0) -> np.ndarray:
+        """Get segment angles between consecutive visible keypoints.
+
+        Args:
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                Default 2.0 (only fully visible keypoints).
+
+        Returns:
+            Structured array with fields ``angle_index`` and ``angle`` in degrees.
+        """
+        from ..validation.image_validation import YPImageValidation
+        validator = YPImageValidation(self.image, self.keypoints)
+        return validator.sequential_angles(visibility_threshold=visibility_threshold)
     
     def to_dict(self) -> Dict[str, Any]:
         """
@@ -231,12 +323,15 @@ class YOLOPoseImage:
             'image': self.image,
             'keypoints': self.keypoints,
             'image_path': self.image_path,
-            'label_path': self.label_path
+            'label_path': self.label_path,
+            'all_keypoints': self.all_keypoints,
+            'person_count': self.person_count,
         }
     
     def __repr__(self) -> str:
         """String representation."""
         return (f"YOLOPoseImage(image={self.image_name}, "
+                f"persons={self.person_count}, "
                 f"keypoints={self.num_keypoints}, "
                 f"visibility={self.has_visibility})")
 
@@ -273,14 +368,13 @@ class YOLOPoseDataset:
     Example 2 - Get LBP features (use YPSetValidation):
         >>> from github.utils.validation import YPSetValidation
         >>> validator = YPSetValidation(dataset)
-        >>> histograms, counts, paths = validator.get_all_lbp_histograms(patch_size=5)
         >>> decimals, counts, paths = validator.get_all_lbp_decimals(patch_size=7)
     
     Example 3 - Single image features (use YPImageValidation):
         >>> from github.utils.validation import YPImageValidation
         >>> sample = dataset[0]
         >>> validator = YPImageValidation(sample['image'], sample['keypoints'])
-        >>> hist = validator.compute_lbp_histograms(patch_size=5)
+        >>> decimals = validator.compute_lbp_decimals(patch_size=5)
     
     Example 4 - Use YOLOPoseImage for per-image operations:
         >>> from utils.datasets import YOLOPoseImage
@@ -288,21 +382,21 @@ class YOLOPoseDataset:
         >>> print(f"Keypoints: {yolo_img.keypoints.shape}")
     """
     
-    def __init__(self, dataset_file: str, labels_dir: str = None):
+    def __init__(self, dataset_file: str, labels_dir: str = None, keypoint_format: str = 'auto'):
         """
         Initialize YOLO Pose dataset.
         
         Args:
-            dataset_file: Path to data.yaml, args.yaml, or train.txt file
-                - data.yaml: YOLO dataset config (auto-detects train/val/test split)
-                - args.yaml: YOLO training config (loads from training directory)
+            dataset_file: Path to a dataset YAML file or train.txt file
+                - any .yaml/.yml file: dataset config (auto-detects train/val/test split)
                 - train.txt: File with relative image paths, one per line
             labels_dir: Directory with label files. If None, infers from dataset_file parent
+            keypoint_format: One of ``'auto'``, ``'xy'``, or ``'xyv'``.
         """
         dataset_file_abs = os.path.abspath(dataset_file)
         
-        # Check if input is data.yaml
-        if dataset_file.endswith('data.yaml') or dataset_file.endswith('data.yml'):
+        # Treat any YAML file as a dataset config.
+        if dataset_file_abs.lower().endswith(('.yaml', '.yml')):
             self.dataset_file, self.dataset_dir = self._load_from_data_yaml(dataset_file_abs, labels_dir)
         else:
             self.dataset_file = dataset_file_abs
@@ -313,6 +407,7 @@ class YOLOPoseDataset:
             self.labels_dir = os.path.join(self.dataset_dir, "labels")
         else:
             self.labels_dir = os.path.abspath(labels_dir)
+        self.keypoint_format = keypoint_format
         
         # Load image paths from train.txt
         with open(self.dataset_file, "r") as f:
@@ -352,20 +447,44 @@ class YOLOPoseDataset:
         found_dir = None
         
         for split in split_priorities:
-            split_path = data_config.get(split)
-            if not split_path:
-                # Try default directory names
-                split_path = os.path.join(dataset_root, split)
+            split_value = data_config.get(split)
+            candidate_paths = []
+
+            if split_value:
+                resolved_split_path = split_value
+                if not os.path.isabs(resolved_split_path):
+                    resolved_split_path = os.path.join(dataset_root, resolved_split_path)
+                candidate_paths.append(os.path.abspath(resolved_split_path))
             else:
-                # Make absolute if relative
-                if not os.path.isabs(split_path):
-                    split_path = os.path.join(dataset_root, split_path)
-            
-            txt_file = os.path.join(split_path, f'{split}.txt')
-            if os.path.exists(txt_file):
-                found_file = txt_file
-                found_dir = split_path
-                print(f"Loading dataset from: {found_file}")
+                candidate_paths.append(os.path.join(dataset_root, split))
+
+            candidate_txt_files = []
+            for candidate_path in candidate_paths:
+                candidate_path_abs = os.path.abspath(candidate_path)
+                if candidate_path_abs.lower().endswith('.txt'):
+                    candidate_txt_files.append(candidate_path_abs)
+                else:
+                    candidate_txt_files.append(os.path.join(candidate_path_abs, f'{split}.txt'))
+
+            candidate_txt_files.extend([
+                os.path.join(dataset_root, f'{split}.txt'),
+                os.path.join(os.path.dirname(data_yaml_path), f'{split}.txt'),
+            ])
+
+            seen_txt_files = set()
+            for txt_file in candidate_txt_files:
+                txt_file_abs = os.path.abspath(txt_file)
+                if txt_file_abs in seen_txt_files:
+                    continue
+                seen_txt_files.add(txt_file_abs)
+
+                if os.path.exists(txt_file_abs):
+                    found_file = txt_file_abs
+                    found_dir = os.path.dirname(txt_file_abs)
+                    print(f"Loading dataset from: {found_file}")
+                    break
+
+            if found_file is not None:
                 break
         
         if not found_file:
@@ -375,6 +494,40 @@ class YOLOPoseDataset:
             )
         
         return found_file, found_dir
+
+    @staticmethod
+    def generate_train_txt_from_images(
+        dataset_root: str,
+        images_dir: str = 'images',
+        output_file: str = None,
+        recursive: bool = True,
+    ) -> str:
+        """Generate train.txt by listing image files under an images directory.
+
+        Args:
+            dataset_root: Root directory of the dataset.
+            images_dir: Images directory path, relative to ``dataset_root`` or absolute.
+            output_file: Output train.txt path. Defaults to ``dataset_root/train.txt``.
+            recursive: Whether to scan nested image subdirectories.
+
+        Returns:
+            Absolute path to the generated train.txt file.
+
+        Example:
+            >>> train_txt = YOLOPoseDataset.generate_train_txt_from_images(
+            ...     dataset_root="./my_dataset",
+            ...     images_dir="images",
+            ... )
+            >>> dataset = YOLOPoseDataset(train_txt)
+        """
+        from .operations import generate_train_txt_from_images
+
+        return generate_train_txt_from_images(
+            dataset_root=dataset_root,
+            images_dir=images_dir,
+            output_file=output_file,
+            recursive=recursive,
+        )
     
     def _validate_pairs(self):
         """Check which image/label pairs exist and are valid."""
@@ -385,10 +538,14 @@ class YOLOPoseDataset:
             image_path = os.path.join(self.dataset_dir, rel_path)
             if not os.path.exists(image_path):
                 continue
-            
-            label_name = os.path.splitext(os.path.basename(rel_path))[0] + ".txt"
-            label_path = os.path.join(self.labels_dir, label_name)
-            if not os.path.exists(label_path):
+
+            label_path = None
+            for candidate_label_path in _candidate_label_paths(rel_path, self.labels_dir):
+                if os.path.exists(candidate_label_path):
+                    label_path = candidate_label_path
+                    break
+
+            if label_path is None:
                 continue
             
             # Try loading to ensure validity
@@ -396,8 +553,11 @@ class YOLOPoseDataset:
                 image = cv2.imread(image_path)
                 if image is None:
                     continue
-                keypoints = YPImageValidation.load_keypoints(label_path)
-                if keypoints is None or keypoints.size == 0:
+                all_keypoints = YPImageValidation.load_all_keypoints_from_file(
+                    label_path,
+                    keypoint_format=self.keypoint_format,
+                )
+                if not any(kpts is not None and kpts.size > 0 for kpts in all_keypoints):
                     continue
                 valid.append((image_path, label_path))
             except Exception:
@@ -407,27 +567,177 @@ class YOLOPoseDataset:
     
     @property
     def stats(self) -> dict:
-        """Get dataset statistics."""
+        """Get dataset statistics.
+        
+        Counts ALL persons per image (not just the first one).
+        This matches get_sequential_distances() behavior.
+        """
         total_images = len(self._valid_pairs)
         
-        # Count total keypoints
+        # Count total keypoints and visible keypoints across ALL persons
         total_keypoints = 0
+        total_visible_keypoints = 0
+        total_persons = 0
+        
         for _, label_path in self._valid_pairs:
             try:
                 from ..validation.image_validation import YPImageValidation
-                kpts = YPImageValidation.load_keypoints(label_path)
-                if kpts is not None:
-                    total_keypoints += len(kpts)
+                # Load ALL persons from this label file (not just the first one)
+                all_kpts = YPImageValidation.load_all_keypoints_from_file(
+                    label_path,
+                    include_visibility=True,
+                    keypoint_format=self.keypoint_format,
+                )
+                
+                for kpts in all_kpts:
+                    if kpts is not None and len(kpts) >= 2:  # Only count persons with at least 2 keypoints
+                        total_persons += 1
+                        total_keypoints += len(kpts)
+                        # Count visible keypoints (visibility >= 2.0)
+                        if kpts.shape[1] >= 3:
+                            visibility = kpts[:, 2]
+                            visible_count = np.sum(visibility >= 2.0)
+                            total_visible_keypoints += visible_count
+                        else:
+                            # If no visibility info, count all as visible
+                            total_visible_keypoints += len(kpts)
             except Exception:
                 pass
         
         return {
             'total_images': total_images,
+            'total_persons': total_persons,
             'total_keypoints': total_keypoints,
+            'total_visible_keypoints': total_visible_keypoints,
             'avg_keypoints_per_image': total_keypoints / total_images if total_images > 0 else 0,
+            'avg_keypoints_per_person': total_keypoints / total_persons if total_persons > 0 else 0,
+            'avg_visible_keypoints_per_image': total_visible_keypoints / total_images if total_images > 0 else 0,
+            'avg_visible_keypoints_per_person': total_visible_keypoints / total_persons if total_persons > 0 else 0,
             'dataset_file': self.dataset_file,
             'labels_dir': self.labels_dir
         }
+    
+    def get_keypoint_distribution(self, verbose: bool = True) -> dict:
+        """Get distribution of visible keypoints per person.
+        
+        Shows how many persons have each count of visible keypoints.
+        
+        Args:
+            verbose: Print formatted distribution table
+            
+        Returns:
+            Dictionary mapping num_visible_keypoints -> count of persons with that many
+            
+        Example:
+            >>> dist = dataset.get_keypoint_distribution()
+            >>> print(dist)  # {5: 10, 6: 45, 7: 120, 8: 234, 9: 3349}
+        """
+        from collections import Counter
+        
+        visible_keypoint_counts = []
+        
+        for _, label_path in self._valid_pairs:
+            try:
+                from ..validation.image_validation import YPImageValidation
+                all_kpts = YPImageValidation.load_all_keypoints_from_file(
+                    label_path,
+                    include_visibility=True,
+                    keypoint_format=self.keypoint_format,
+                )
+                
+                for kpts in all_kpts:
+                    if kpts is not None and len(kpts) >= 2:
+                        if kpts.shape[1] >= 3:
+                            visibility = kpts[:, 2]
+                            visible_count = np.sum(visibility >= 2.0)
+                        else:
+                            visible_count = len(kpts)
+                        visible_keypoint_counts.append(int(visible_count))
+            except Exception:
+                pass
+        
+        distribution = dict(sorted(Counter(visible_keypoint_counts).items()))
+        
+        if verbose:
+            print("Distribution of Visible Keypoints per Person:")
+            print("-" * 60)
+            print(f"{'Visible Keypoints':>20} | {'Count':>10} | {'Percentage':>10}")
+            print("-" * 60)
+            
+            total = sum(distribution.values())
+            for num_keypoints in sorted(distribution.keys()):
+                count = distribution[num_keypoints]
+                percentage = 100 * count / total if total > 0 else 0
+                print(f"{num_keypoints:>20} | {count:>10} | {percentage:>10.2f}%")
+            
+            print("-" * 60)
+            print(f"{'Total Persons':>20} | {total:>10}")
+            print()
+        
+        return distribution
+    
+    def get_keypoint_statistics(self, verbose: bool = True) -> dict:
+        """Get visibility statistics for each keypoint index.
+        
+        Shows how many times each keypoint (0-8) appears, is visible, or is occluded.
+        
+        Args:
+            verbose: Print formatted statistics table
+            
+        Returns:
+            Dictionary mapping keypoint_index -> {'total': count, 'visible': count, 'occluded': count}
+            
+        Example:
+            >>> stats = dataset.get_keypoint_statistics()
+            >>> print(stats[0])  # {'total': 4758, 'visible': 4702, 'occluded': 56}
+        """
+        stats = {}
+        
+        for _, label_path in self._valid_pairs:
+            try:
+                from ..validation.image_validation import YPImageValidation
+                all_kpts = YPImageValidation.load_all_keypoints_from_file(
+                    label_path,
+                    include_visibility=True,
+                    keypoint_format=self.keypoint_format,
+                )
+                
+                for kpts in all_kpts:
+                    if kpts is not None and len(kpts) >= 2:
+                        for keypoint_idx in range(len(kpts)):
+                            if keypoint_idx not in stats:
+                                stats[keypoint_idx] = {'total': 0, 'visible': 0, 'occluded': 0}
+                            
+                            stats[keypoint_idx]['total'] += 1
+                            
+                            if kpts.shape[1] >= 3:
+                                visibility = kpts[keypoint_idx, 2]
+                                if visibility >= 2.0:
+                                    stats[keypoint_idx]['visible'] += 1
+                                else:
+                                    stats[keypoint_idx]['occluded'] += 1
+                            else:
+                                stats[keypoint_idx]['visible'] += 1
+            except Exception:
+                pass
+        
+        if verbose:
+            print("Keypoint Statistics (Visibility across entire dataset):")
+            print("-" * 85)
+            print(f"{'Keypoint':>10} | {'Total':>10} | {'Visible':>10} | {'Occluded':>10} | {'Visibility %':>12}")
+            print("-" * 85)
+            
+            for kp_idx in sorted(stats.keys()):
+                total = stats[kp_idx]['total']
+                visible = stats[kp_idx]['visible']
+                occluded = stats[kp_idx]['occluded']
+                visibility_pct = 100 * visible / total if total > 0 else 0
+                
+                print(f"{kp_idx:>10} | {total:>10} | {visible:>10} | {occluded:>10} | {visibility_pct:>11.2f}%")
+            
+            print("-" * 85)
+        
+        return stats
     
     def __len__(self) -> int:
         """Return number of images in dataset."""
@@ -444,7 +754,11 @@ class YOLOPoseDataset:
             try:
                 # Load image and keypoints
                 image = cv2.imread(image_path)
-                keypoints = YPImageValidation.load_keypoints(label_path)
+                all_keypoints = YPImageValidation.load_all_keypoints_from_file(
+                    label_path,
+                    keypoint_format=self.keypoint_format,
+                )
+                keypoints = _first_person_keypoints(all_keypoints)
                 
                 if image is None or keypoints is None or keypoints.size == 0:
                     continue
@@ -453,7 +767,9 @@ class YOLOPoseDataset:
                     'image': image,
                     'keypoints': keypoints,
                     'image_path': image_path,
-                    'label_path': label_path
+                    'label_path': label_path,
+                    'all_keypoints': all_keypoints,
+                    'person_count': len(all_keypoints),
                 }
             except Exception:
                 continue
@@ -477,25 +793,31 @@ class YOLOPoseDataset:
         image_path, label_path = self._valid_pairs[idx]
         
         image = cv2.imread(image_path)
-        keypoints = YPImageValidation.load_keypoints(label_path)
+        all_keypoints = YPImageValidation.load_all_keypoints_from_file(
+            label_path,
+            keypoint_format=self.keypoint_format,
+        )
+        keypoints = _first_person_keypoints(all_keypoints)
         
         return YOLOSample(
             image=image,
             keypoints=keypoints,
             image_path=image_path,
-            label_path=label_path
+            label_path=label_path,
+            all_keypoints=all_keypoints,
+            person_count=len(all_keypoints),
         )    
-    def get_sequential_distances(self, idx: int, visibility_threshold: float = 0.5) -> np.ndarray:
+    def get_sequential_distances(self, idx: int, visibility_threshold: float = 2.0) -> np.ndarray:
         """
         Get sequential distances for a single sample by index.
         
         Computes Euclidean distances between consecutive visible keypoints.
-        Skips distances involving hidden/occluded keypoints (visibility < threshold).
+        Skips distances involving hidden/occluded keypoints or out-of-frame keypoints.
         
         Args:
             idx: Sample index in dataset
-            visibility_threshold: Minimum visibility score (0-1) to consider a keypoint visible.
-                                Default 0.5. Keypoints below this are skipped.
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                                Default 2.0 (only fully visible keypoints).
         
         Returns:
             Array of distances between consecutive visible keypoints.
@@ -517,3 +839,346 @@ class YOLOPoseDataset:
         from ..validation.image_validation import YPImageValidation
         validator = YPImageValidation(image, keypoints)
         return validator.sequential_distances(visibility_threshold=visibility_threshold)
+
+    def get_sequential_angles(self, idx: int, visibility_threshold: float = 2.0) -> np.ndarray:
+        """Get segment angles for a single sample by index.
+
+        Args:
+            idx: Sample index in dataset.
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                Default 2.0 (only fully visible keypoints).
+
+        Returns:
+            Structured array with fields ``angle_index`` and ``angle`` in degrees.
+        """
+        sample = self[idx]
+        image = sample['image']
+        keypoints = sample['keypoints']
+
+        from ..validation.image_validation import YPImageValidation
+        validator = YPImageValidation(image, keypoints)
+        return validator.sequential_angles(visibility_threshold=visibility_threshold)
+    
+    def get_all_keypoints(self) -> list:
+        """
+        Get all keypoints from dataset as a list.
+        
+        Returns:
+            List of keypoint arrays where each element is shape (N, 2) or (N, 3)
+            
+        Example:
+            >>> dataset = YOLOPoseDataset("train.txt")
+            >>> all_kpts = dataset.get_all_keypoints()
+            >>> print(f"Total images: {len(all_kpts)}")
+            >>> print(f"First image keypoints: {all_kpts[0].shape}")
+        """
+        return [sample['keypoints'] for sample in self]
+    
+    def get_all_images(self) -> list:
+        """
+        Get all images from dataset as a list.
+        
+        WARNING: Loads all images into memory. Only use for small/medium datasets.
+        
+        Returns:
+            List of image numpy arrays (H, W, 3 in BGR format)
+            
+        Example:
+            >>> dataset = YOLOPoseDataset("train.txt")
+            >>> all_imgs = dataset.get_all_images()
+            >>> print(f"Total images: {len(all_imgs)}")
+            >>> print(f"First image shape: {all_imgs[0].shape}")
+        """
+        return [sample['image'] for sample in self]
+    
+    def get_all_image_paths(self) -> list:
+        """
+        Get all image file paths from dataset.
+        
+        Returns:
+            List of absolute image file paths
+            
+        Example:
+            >>> dataset = YOLOPoseDataset("train.txt")
+            >>> paths = dataset.get_all_image_paths()
+            >>> print(f"Total images: {len(paths)}")
+            >>> print(f"First image: {paths[0]}")
+        """
+        return [path for path, _ in self._valid_pairs]
+    
+    def get_all_label_paths(self) -> list:
+        """
+        Get all label file paths from dataset.
+        
+        Returns:
+            List of absolute label file paths (.txt)
+            
+        Example:
+            >>> dataset = YOLOPoseDataset("train.txt")
+            >>> paths = dataset.get_all_label_paths()
+            >>> print(f"Total labels: {len(paths)}")
+            >>> print(f"First label: {paths[0]}")
+        """
+        return [path for _, path in self._valid_pairs]
+    
+    def get_all_samples(self) -> list:
+        """
+        Get all samples from dataset.
+        
+        Returns:
+            List of dicts with keys: 'image', 'keypoints', 'image_path', 'label_path'
+            
+        WARNING: Loads all images into memory. Only use for small/medium datasets.
+        
+        Example:
+            >>> dataset = YOLOPoseDataset("train.txt")
+            >>> samples = dataset.get_all_samples()
+            >>> print(f"Total samples: {len(samples)}")
+            >>> print(f"First sample keys: {samples[0].keys()}")
+        """
+        return [sample for sample in self]
+    
+    
+
+    def replace_angle_preserving_keypoints(
+        self,
+        sample_count: int,
+        max_keypoints_to_shift: int,
+        max_endpoint_shift: float,
+        output_dataset_path: str = None,
+        seed: int = None,
+    ) -> list:
+        """Replace existing keypoints in dataset labels while preserving segment angles.
+
+        This method modifies existing label files in place. It does not create
+        additional dataset samples.
+
+        Args:
+            sample_count: Number of existing person annotations to replace.
+            max_keypoints_to_shift: Maximum number of randomly selected keypoints
+                to shift in one replaced annotation.
+            max_endpoint_shift: Maximum shift magnitude for the first and last
+                keypoint in the sequence.
+            output_dataset_path: Optional path where a copied dataset with
+                modified labels should be written.
+            seed: Optional RNG seed for reproducibility.
+
+        Returns:
+            List of replacement result objects.
+        """
+        from .operations import replace_angle_preserving_keypoints
+
+        return replace_angle_preserving_keypoints(
+            self,
+            sample_count=sample_count,
+            max_keypoints_to_shift=max_keypoints_to_shift,
+            max_endpoint_shift=max_endpoint_shift,
+            output_dataset_path=output_dataset_path,
+            seed=seed,
+        )
+
+    def replace_rigid_keypoints(
+        self,
+        sample_count: int,
+        max_rotation_degrees: float,
+        max_translation_distance: float,
+        transform_mode: str = 'both',
+        output_dataset_path: str = None,
+        seed: int = None,
+    ) -> list:
+        """Replace existing keypoints using translation, rotation, or both.
+
+        This method modifies existing label files in place. It applies a rigid
+        transform to all keypoints of selected persons, preserving their mutual
+        geometry.
+
+        Args:
+            sample_count: Number of existing person annotations to replace.
+            max_rotation_degrees: Maximum absolute rotation angle in degrees.
+            max_translation_distance: Maximum translation magnitude in normalized units.
+            transform_mode: One of ``'translate'``, ``'rotate'`` or ``'both'``.
+            output_dataset_path: Optional path where a copied dataset with
+                modified labels should be written.
+            seed: Optional RNG seed for reproducibility.
+
+        Returns:
+            List of rigid replacement result objects.
+        """
+        from .operations import replace_rigid_keypoints
+
+        return replace_rigid_keypoints(
+            self,
+            sample_count=sample_count,
+            max_rotation_degrees=max_rotation_degrees,
+            max_translation_distance=max_translation_distance,
+            transform_mode=transform_mode,
+            output_dataset_path=output_dataset_path,
+            seed=seed,
+        )
+
+    def replace_axis_aligned_keypoints(
+        self,
+        sample_count: int,
+        max_keypoints_to_shift: int,
+        max_shift_distance: float,
+        direction_mode: str = 'both',
+        output_dataset_path: str = None,
+        seed: int = None,
+    ) -> list:
+        """Replace existing keypoints by shifting a random subset along axes.
+
+        This method modifies existing label files in place. Each selected person
+        gets a random subset of keypoints shifted horizontally, vertically, or in
+        both axes.
+
+        Args:
+            sample_count: Number of existing person annotations to replace.
+            max_keypoints_to_shift: Maximum number of keypoints to shift per person.
+            max_shift_distance: Maximum per-axis shift magnitude in normalized units.
+            direction_mode: One of ``'horizontal'``, ``'vertical'`` or ``'both'``.
+            output_dataset_path: Optional path where a copied dataset with
+                modified labels should be written.
+            seed: Optional RNG seed for reproducibility.
+
+        Returns:
+            List of axis-aligned replacement result objects.
+        """
+        from .operations import replace_axis_aligned_keypoints
+
+        return replace_axis_aligned_keypoints(
+            self,
+            sample_count=sample_count,
+            max_keypoints_to_shift=max_keypoints_to_shift,
+            max_shift_distance=max_shift_distance,
+            direction_mode=direction_mode,
+            output_dataset_path=output_dataset_path,
+            seed=seed,
+        )
+
+    def export_random_subset(
+        self,
+        sample_count: int,
+        output_dataset_path: str,
+        seed: int = None,
+    ) -> str:
+        """Export a random subset of dataset samples into a new dataset directory.
+
+        The new dataset contains only the selected images, their corresponding
+        labels, a rewritten split file, and a copied ``data.yaml`` when the
+        source dataset provides one.
+
+        Args:
+            sample_count: Number of unique samples to export.
+            output_dataset_path: Destination directory for the new dataset.
+            seed: Optional RNG seed for reproducible sampling.
+
+        Returns:
+            Absolute path to the generated split file in the new dataset.
+
+        Example:
+            >>> dataset = YOLOPoseDataset("train.txt")
+            >>> subset_train = dataset.export_random_subset(
+            ...     sample_count=100,
+            ...     output_dataset_path="./subset_dataset",
+            ...     seed=123,
+            ... )
+            >>> print(subset_train)
+        """
+        from .operations import export_random_dataset_subset
+
+        return export_random_dataset_subset(
+            self,
+            sample_count=sample_count,
+            output_dataset_path=output_dataset_path,
+            seed=seed,
+        )
+
+    def export_dataset_partitions(
+        self,
+        part_count: int,
+        output_root_dir: str,
+        seed: int = None,
+        shuffle: bool = True,
+    ) -> List[str]:
+        """Export the dataset into a chosen number of parts.
+
+        Args:
+            part_count: Number of parts to create.
+            output_root_dir: Destination directory for generated part folders.
+            seed: Optional RNG seed for reproducible shuffling.
+            shuffle: Whether to shuffle samples before partitioning.
+
+        Returns:
+            List of generated split file paths, one per part.
+
+        Example:
+            >>> dataset = YOLOPoseDataset("train.txt")
+            >>> split_files = dataset.export_dataset_partitions(
+            ...     part_count=5,
+            ...     output_root_dir="./dataset_parts",
+            ...     shuffle=False,
+            ... )
+            >>> print(split_files)
+        """
+        from .operations import export_dataset_partitions
+
+        return export_dataset_partitions(
+            self,
+            part_count=part_count,
+            output_root_dir=output_root_dir,
+            seed=seed,
+            shuffle=shuffle,
+        )
+
+    def remove_duplicates(
+        self,
+        duplicates: Sequence[Sequence[Any]],
+        output_dataset_path: Optional[str] = None,
+        keep: str = 'first',
+    ) -> Dict[str, Any]:
+        """Remove duplicate samples described by ``find_near_duplicates`` output.
+
+        Args:
+            duplicates: Iterable of duplicate tuples like
+                ``(file_a, file_b, similarity)``.
+            output_dataset_path: Optional destination for a cleaned dataset copy.
+                When omitted, the current split file is rewritten in place.
+            keep: Which sample to keep from each duplicate group: ``'first'`` or
+                ``'last'`` according to current dataset order.
+
+        Returns:
+            Summary dictionary with removed and kept sample paths.
+        """
+        from .operations import remove_duplicate_samples_from_dataset
+
+        return remove_duplicate_samples_from_dataset(
+            self,
+            duplicates=duplicates,
+            output_dataset_path=output_dataset_path,
+            keep=keep,
+        )
+
+    def remove_samples_by_image_paths(
+        self,
+        image_paths: Sequence[str],
+        delete_files: bool = True,
+    ) -> Dict[str, Any]:
+        """Remove samples identified by absolute or split-relative image paths.
+
+        The split file is rewritten in place. When ``delete_files`` is true,
+        matching images and their label files are also deleted from disk.
+
+        Args:
+            image_paths: Iterable of image paths to remove.
+            delete_files: Whether to delete image and label files from disk.
+
+        Returns:
+            Summary dictionary with removal counts and unmatched paths.
+        """
+        from .operations import remove_samples_by_image_paths
+
+        return remove_samples_by_image_paths(
+            self,
+            image_paths=image_paths,
+            delete_files=delete_files,
+        )

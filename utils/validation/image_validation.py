@@ -1,15 +1,121 @@
 """Single image LBP validation methods."""
 
-from typing import Union
+from typing import Union, List, Optional, Sequence, Tuple
 import numpy as np
 import cv2
+
+
+def _normalize_keypoint_format(keypoint_format: str) -> str:
+    """Validate and normalize keypoint format selector."""
+    normalized_format = keypoint_format.lower().strip()
+    if normalized_format not in {"auto", "xy", "xyv"}:
+        raise ValueError("keypoint_format must be one of: 'auto', 'xy', 'xyv'")
+    return normalized_format
+
+
+def _looks_like_visibility_values(values: List[float]) -> bool:
+    """Return whether provided values resemble YOLO visibility flags."""
+    return all(abs(value - round(value)) < 1e-6 and int(round(value)) in {0, 1, 2} for value in values)
+
+
+def _resolve_keypoint_format(values: List[float], keypoint_format: str) -> str:
+    """Resolve the keypoint serialization format for one YOLO label row."""
+    normalized_format = _normalize_keypoint_format(keypoint_format)
+    if normalized_format != "auto":
+        return normalized_format
+
+    value_count = len(values)
+    if value_count == 0:
+        return "xyv"
+
+    supports_xyv = value_count % 3 == 0
+    supports_xy = value_count % 2 == 0
+
+    if supports_xyv and not supports_xy:
+        return "xyv"
+    if supports_xy and not supports_xyv:
+        return "xy"
+    if supports_xyv and supports_xy:
+        visibility_values = values[2::3]
+        return "xyv" if _looks_like_visibility_values(visibility_values) else "xy"
+
+    raise ValueError(
+        "Could not infer keypoint format from label row. "
+        "Use keypoint_format='xy' or keypoint_format='xyv'."
+    )
+
+
+def _parse_yolo_keypoint_values(values: List[float], include_visibility: bool, keypoint_format: str) -> np.ndarray:
+    """Parse YOLO keypoint values encoded as either xy or xyv."""
+    resolved_format = _resolve_keypoint_format(values, keypoint_format)
+    step = 3 if resolved_format == "xyv" else 2
+    keypoints = []
+
+    for value_index in range(0, len(values), step):
+        if resolved_format == "xyv":
+            if value_index + 2 >= len(values):
+                continue
+            if include_visibility:
+                keypoints.append([
+                    values[value_index],
+                    values[value_index + 1],
+                    values[value_index + 2],
+                ])
+            else:
+                keypoints.append([values[value_index], values[value_index + 1]])
+        else:
+            if value_index + 1 >= len(values):
+                continue
+            keypoints.append([values[value_index], values[value_index + 1]])
+
+    if not keypoints:
+        column_count = 3 if include_visibility and resolved_format == "xyv" else 2
+        return np.empty((0, column_count), dtype=float)
+
+    return np.asarray(keypoints, dtype=float)
+
+
+def normalize_distance_connections(
+    distance_connections: Optional[Sequence[Tuple[int, int]]]
+) -> Optional[List[Tuple[int, int]]]:
+    """Validate and normalize an optional list of keypoint index pairs."""
+    if distance_connections is None:
+        return None
+
+    normalized_connections: List[Tuple[int, int]] = []
+    for connection_index, connection in enumerate(distance_connections):
+        if len(connection) != 2:
+            raise ValueError(
+                "Each distance connection must contain exactly two keypoint indices; "
+                f"got {connection!r} at position {connection_index}."
+            )
+
+        start_idx = int(connection[0])
+        end_idx = int(connection[1])
+        if start_idx < 0 or end_idx < 0:
+            raise ValueError(
+                "Distance connection indices must be non-negative; "
+                f"got {connection!r} at position {connection_index}."
+            )
+        if start_idx == end_idx:
+            raise ValueError(
+                "Distance connection cannot reference the same keypoint twice; "
+                f"got {connection!r} at position {connection_index}."
+            )
+
+        normalized_connections.append((start_idx, end_idx))
+
+    if not normalized_connections:
+        raise ValueError("distance_connections cannot be empty")
+
+    return normalized_connections
 
 
 class YPImageValidation:
     """
     Validation methods for a single image with annotations.
     
-    Handles LBP computation, histograms, and binary decimal representations
+    Handles LBP computation and binary decimal representations
     for individual images with keypoint annotations.
     
     Use this class for per-image or per-keypoint feature extraction.
@@ -25,13 +131,11 @@ class YPImageValidation:
         >>> keypoints = np.array([[100, 50], [150, 200]])  # (N, 2)
         >>> 
         >>> validator = YPImageValidation(image, keypoints)
-        >>> hist = validator.compute_lbp_histograms(patch_size=5)  # (N, 256)
         >>> decimals = validator.compute_lbp_decimals(patch_size=7)  # (N,)
     
     Example 2 - Process individual keypoints:
         >>> validator = YPImageValidation(image, keypoints)
         >>> for i, (x, y) in enumerate(keypoints):
-        ...     hist = validator.compute_lbp_histogram_single(int(x), int(y))
         ...     decimal = validator.compute_lbp_decimal_single(int(x), int(y))
     
     Example 3 - Visualize single image:
@@ -59,82 +163,471 @@ class YPImageValidation:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         
         self.image = image
-        self.keypoints = np.asarray(keypoints)
         self.h, self.w = image.shape[:2]
-    
-    def sequential_distances(self, visibility_threshold: float = 0.5) -> np.ndarray:
-        """
-        Calculate Euclidean distances between consecutive visible keypoints.
+        self.keypoints = np.asarray(keypoints, dtype=float).copy()
         
-        Computes the distance from keypoint[i] to keypoint[i+1] for consecutive visible pairs.
-        Skips distances involving hidden/occluded keypoints (visibility < threshold).
+        # Keep original (normalized) keypoints for distance computation.
+        # Distances are scale-independent and must use the 0-1 YOLO coordinate space.
+        self.keypoints_norm = self.keypoints.copy()
+        
+        # Denormalize keypoints to pixel coordinates for LBP (needs real image pixels).
+        # Check only x, y columns (columns 0-1), not visibility if present
+        if self.keypoints.size > 0 and self.keypoints[:, :2].max() <= 1.0:
+            self.keypoints[:, 0] *= self.w  # Denormalize x coordinate
+            self.keypoints[:, 1] *= self.h  # Denormalize y coordinate
+    
+    def sequential_distances(
+        self,
+        visibility_threshold: float = 2.0,
+        distance_connections: Optional[Sequence[Tuple[int, int]]] = None,
+    ) -> np.ndarray:
+        """
+        Calculate Euclidean distances between visible keypoint pairs.
+        
+        By default computes the distance from keypoint[i] to keypoint[i+1] for
+        consecutive visible pairs. When ``distance_connections`` is provided,
+        computes distances for those explicit keypoint pairs instead.
         
         Args:
-            visibility_threshold: Minimum visibility score (0-1) to consider a keypoint visible.
-                                Default 0.5. Keypoints below this are skipped.
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                                Default 2.0 (only fully visible keypoints).
+            distance_connections: Optional ordered list of ``(start_idx, end_idx)``
+                                keypoint pairs to measure instead of consecutive pairs.
         
         Returns:
-            Array of distances between consecutive visible keypoints.
-            Returns empty array if fewer than 2 visible keypoints.
+            Structured array with fields 'distance_index' (int) and 'distance' (float)
+            for each valid measured pair. Distance indices always refer to the
+            position in the active connection list. With the default behavior,
+            this still matches ``distance[i] = keypoint[i] -> keypoint[i+1]``.
             
         Example:
             >>> validator = YPImageValidation(image, keypoints)
-            >>> distances = validator.sequential_distances(visibility_threshold=0.5)
-            >>> print(distances)  # Array of distances between consecutive keypoints
+            >>> distances = validator.sequential_distances(visibility_threshold=2.0)
+            >>> print(distances['distance_index'])  # [0, 1, 3, 5, ...] (absolute indices, may skip values if keypoints hidden)
+            >>> print(distances['distance'])        # distance values
         """
         return YPImageValidation.compute_sequential_distances(
-            self.keypoints, visibility_threshold=visibility_threshold
+            self.keypoints_norm,
+            visibility_threshold=visibility_threshold,
+            distance_connections=distance_connections,
+        )
+
+    def sequential_angles(self, visibility_threshold: float = 2.0) -> np.ndarray:
+        """Calculate angles of consecutive visible keypoint segments.
+
+        Computes the orientation of the segment from keypoint[i] to keypoint[i+1]
+        for consecutive visible pairs. Angles are reported in degrees using the
+        standard mathematical convention: ``0`` points right, ``90`` points up,
+        ``-90`` points down.
+
+        Args:
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                Default 2.0 (only fully visible keypoints).
+
+        Returns:
+            Structured array with fields ``angle_index`` (int) and ``angle`` (float)
+            for each valid consecutive keypoint pair.
+        """
+        return YPImageValidation.compute_sequential_angles(
+            self.keypoints_norm,
+            visibility_threshold=visibility_threshold,
         )
     
     @staticmethod
-    def compute_sequential_distances(keypoints: np.ndarray, visibility_threshold: float = 0.5) -> np.ndarray:
+    def compute_sequential_distances(
+        keypoints: np.ndarray,
+        visibility_threshold: float = 2.0,
+        distance_connections: Optional[Sequence[Tuple[int, int]]] = None,
+    ) -> np.ndarray:
         """
-        Calculate Euclidean distances between consecutive visible keypoints (static).
+        Calculate Euclidean distances between visible keypoint pairs (static).
         
-        Static method for computing sequential distances without creating an instance.
+        Static method for computing default consecutive distances or distances for
+        an explicit ordered list of keypoint pairs without creating an instance.
         
         Args:
             keypoints: Array of shape (N, 2) with [x, y] OR (N, 3) with [x, y, visibility].
-            visibility_threshold: Minimum visibility score (0-1) to consider a keypoint visible.
-                                Default 0.5. Keypoints below this are skipped.
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                                Default 2.0 (only fully visible keypoints). Keypoints below this are skipped.
+            distance_connections: Optional ordered list of ``(start_idx, end_idx)``
+                                keypoint pairs to measure. If omitted, uses consecutive
+                                pairs ``(0, 1), (1, 2), ...``.
         
         Returns:
-            Array of distances between consecutive visible keypoints.
+            Structured array with fields 'distance_index' (int) and 'distance' (float)
+            for each visible keypoint pair. Distance indices refer to the position
+            within the active connection list.
             
         Example:
-            >>> kpts = np.array([[0.0, 0.0, 1.0], [1.0, 0.0, 0.3], [1.0, 1.0, 1.0]])
-            >>> distances = YPImageValidation.compute_sequential_distances(kpts, visibility_threshold=0.5)
+            >>> kpts = np.array([[0.0, 0.0, 2.0], [1.0, 0.0, 1.0], [1.0, 1.0, 2.0]])
+            >>> distances = YPImageValidation.compute_sequential_distances(kpts, visibility_threshold=2.0)
+            >>> print(distances['distance_index'])  # [0, 2, ...] (absolute indices: skips 1 since keypoint[1] hidden)
+            >>> print(distances['distance'])        # distance values
         """
         keypoints = np.asarray(keypoints)
         coords = keypoints[:, :2]
+        normalized_connections = normalize_distance_connections(distance_connections)
         
         if keypoints.shape[1] >= 3:
             visibility = keypoints[:, 2]
             visible_mask = visibility >= visibility_threshold
         else:
             visible_mask = np.ones(len(keypoints), dtype=bool)
+
+        if normalized_connections is None:
+            normalized_connections = [(i, i + 1) for i in range(len(keypoints) - 1)]
+
+        for connection_index, (start_idx, end_idx) in enumerate(normalized_connections):
+            if start_idx >= len(keypoints) or end_idx >= len(keypoints):
+                raise ValueError(
+                    "distance_connections contains an out-of-range keypoint index; "
+                    f"got {(start_idx, end_idx)} at position {connection_index} for {len(keypoints)} keypoints."
+                )
         
         distances = []
+        distance_indices = []
+        
+        for connection_index, (start_idx, end_idx) in enumerate(normalized_connections):
+            if visible_mask[start_idx] and visible_mask[end_idx]:
+                dist = np.linalg.norm(coords[start_idx] - coords[end_idx])
+                distances.append(dist)
+                distance_indices.append(connection_index)
+        
+        if distances:
+            result = np.array(
+                list(zip(distance_indices, distances)),
+                dtype=[('distance_index', 'i4'), ('distance', 'f8')]
+            )
+        else:
+            result = np.array([], dtype=[('distance_index', 'i4'), ('distance', 'f8')])
+        
+        return result
+
+    @staticmethod
+    def compute_sequential_angles(keypoints: np.ndarray, visibility_threshold: float = 2.0) -> np.ndarray:
+        """Calculate angles of consecutive visible keypoint segments (static).
+
+        The angle is computed for the vector from keypoint[i] to keypoint[i+1].
+        To preserve the standard mathematical sign convention on images, the
+        y-axis delta is negated before calling ``arctan2``.
+
+        Args:
+            keypoints: Array of shape (N, 2) with [x, y] OR (N, 3) with
+                [x, y, visibility].
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                Default 2.0 (only fully visible keypoints). Keypoints below this are skipped.
+
+        Returns:
+            Structured array with fields ``angle_index`` (int) and ``angle`` (float)
+            where ``angle_index`` is the absolute start index of the segment and
+            ``angle`` is reported in degrees in the range ``[-180, 180]``.
+        """
+        keypoints = np.asarray(keypoints)
+        coords = keypoints[:, :2]
+
+        if keypoints.shape[1] >= 3:
+            visibility = keypoints[:, 2]
+            visible_mask = visibility >= visibility_threshold
+        else:
+            visible_mask = np.ones(len(keypoints), dtype=bool)
+
+        angles = []
+        angle_indices = []
+
         for i in range(len(keypoints) - 1):
             if visible_mask[i] and visible_mask[i + 1]:
-                dist = np.linalg.norm(coords[i] - coords[i + 1])
-                distances.append(dist)
+                delta = coords[i + 1] - coords[i]
+                angle = np.degrees(np.arctan2(-delta[1], delta[0]))
+                angles.append(float(angle))
+                angle_indices.append(i)
+
+        if angles:
+            result = np.array(
+                list(zip(angle_indices, angles)),
+                dtype=[('angle_index', 'i4'), ('angle', 'f8')]
+            )
+        else:
+            result = np.array([], dtype=[('angle_index', 'i4'), ('angle', 'f8')])
+
+        return result
+    
+    def get_sequential_distances(
+        self,
+        visibility_threshold: float = 2.0,
+        distance_connections: Optional[Sequence[Tuple[int, int]]] = None,
+    ) -> np.ndarray:
+        """
+        Compute distances between visible keypoint pairs.
         
-        return np.array(distances) if distances else np.array([])
+        By default computes consecutive distances. When ``distance_connections``
+        is provided, computes distances for those explicit keypoint pairs.
+        
+        Args:
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                                Default 2.0 (only fully visible keypoints).
+            distance_connections: Optional ordered list of ``(start_idx, end_idx)``
+                                keypoint pairs to measure instead of consecutive pairs.
+        
+        Returns:
+            Structured array with fields 'distance_index' (int) and 'distance' (float).
+            Each row represents one distance between visible keypoint pairs.
+            Distance indices refer to the position within the active connection list.
+            
+        Example:
+            >>> validator = YPImageValidation(image, keypoints)
+            >>> distances = validator.get_sequential_distances(visibility_threshold=0.5)
+            >>> print(distances)  # array([(0, 0.5), (2, 1.2), (3, 0.8), ...]) (note: index 1 skipped if keypoint[1] hidden)
+            >>> print(distances['distance_index'])  # [0, 2, 3, ...] (absolute indices)
+            >>> print(distances['distance'])        # [0.5, 1.2, 0.8, ...]
+        """
+        return YPImageValidation.compute_sequential_distances(
+            self.keypoints_norm,
+            visibility_threshold=visibility_threshold,
+            distance_connections=distance_connections,
+        )
+
+    def get_sequential_angles(self, visibility_threshold: float = 2.0) -> np.ndarray:
+        """Compute angles between consecutive visible keypoints.
+
+        Args:
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                Default 2.0 (only fully visible keypoints).
+
+        Returns:
+            Structured array with fields ``angle_index`` and ``angle``.
+            Each row corresponds to the segment from keypoint[i] to keypoint[i+1].
+        """
+        return YPImageValidation.compute_sequential_angles(
+            self.keypoints_norm,
+            visibility_threshold=visibility_threshold,
+        )
+
+    @staticmethod
+    def compute_keypoint_mask_metrics(
+        keypoints: np.ndarray,
+        mask: np.ndarray,
+        image_shape: tuple,
+        visibility_threshold: Optional[float] = 2.0,
+    ) -> np.ndarray:
+        """Compute mask-membership and horizontal edge distances for keypoints.
+
+        For each keypoint, this method checks whether the point lies inside the
+        binary mask and computes the horizontal distance to the left and right
+        edges of the connected mask segment that contains the keypoint.
+
+        Distances are normalized by the width of the local mask span in that row:
+        ``row_width = right_edge - left_edge``. When no foreground exists in the
+        keypoint row, the keypoint lies outside the image, or the keypoint is not
+        inside the mask, normalized distances are returned as ``NaN``.
+
+        Args:
+            keypoints: Array of shape (N, 2) or (N, 3) with ``[x, y]`` or
+                ``[x, y, visibility]``. Coordinates may be normalized or pixel-based.
+            mask: Binary mask of shape ``(H, W)`` or multi-channel mask convertible
+                to a foreground map via ``mask > 0``.
+            image_shape: Image shape used to denormalize keypoints when needed.
+            visibility_threshold: If provided and keypoints include visibility,
+                keypoints below this threshold return ``inside_mask=0`` and
+                ``NaN`` distances.
+
+        Returns:
+            Structured array with fields:
+            - ``keypoint_index``: Original keypoint index
+            - ``is_visible``: ``1`` if the keypoint passed visibility filtering else ``0``
+            - ``inside_mask``: ``1`` if the keypoint lies inside the mask else ``0``
+            - ``left_distance``: Normalized horizontal distance to left mask edge
+            - ``right_distance``: Normalized horizontal distance to right mask edge
+        """
+        keypoints = np.asarray(keypoints, dtype=float)
+        if keypoints.size == 0:
+            return np.array(
+                [],
+                dtype=[
+                    ('keypoint_index', 'i4'),
+                    ('is_visible', 'i4'),
+                    ('inside_mask', 'i4'),
+                    ('left_distance', 'f8'),
+                    ('right_distance', 'f8'),
+                ],
+            )
+
+        mask_array = np.asarray(mask)
+        if mask_array.ndim == 3:
+            mask_array = np.any(mask_array > 0, axis=2)
+        else:
+            mask_array = mask_array > 0
+
+        height, width = image_shape[:2]
+        if mask_array.shape != (height, width):
+            raise ValueError(
+                f"Mask shape {mask_array.shape} does not match image shape {(height, width)}."
+            )
+
+        coords = keypoints[:, :2].copy()
+        if coords.size > 0 and np.nanmax(coords) <= 1.0:
+            coords[:, 0] *= width
+            coords[:, 1] *= height
+
+        results = []
+        for keypoint_index, (x_coord, y_coord) in enumerate(coords):
+            is_visible = 1
+            if visibility_threshold is not None and keypoints.shape[1] >= 3:
+                if keypoints[keypoint_index, 2] < visibility_threshold:
+                    is_visible = 0
+                    results.append((keypoint_index, is_visible, 0, np.nan, np.nan))
+                    continue
+
+            if not (0 <= x_coord < width and 0 <= y_coord < height):
+                results.append((keypoint_index, is_visible, 0, np.nan, np.nan))
+                continue
+
+            pixel_x = int(np.clip(np.round(x_coord), 0, width - 1))
+            pixel_y = int(np.clip(np.round(y_coord), 0, height - 1))
+            row_indices = np.flatnonzero(mask_array[pixel_y])
+
+            if row_indices.size == 0:
+                results.append((keypoint_index, is_visible, 0, np.nan, np.nan))
+                continue
+
+            inside_mask = int(mask_array[pixel_y, pixel_x])
+            if inside_mask:
+                left_idx = pixel_x
+                right_idx = pixel_x
+
+                while left_idx > 0 and mask_array[pixel_y, left_idx - 1]:
+                    left_idx -= 1
+                while right_idx < width - 1 and mask_array[pixel_y, right_idx + 1]:
+                    right_idx += 1
+
+                left_edge = float(left_idx)
+                right_edge = float(right_idx)
+                row_width = max(right_edge - left_edge, 1.0)
+                left_distance = abs(float(x_coord) - left_edge) / row_width
+                right_distance = abs(right_edge - float(x_coord)) / row_width
+            else:
+                left_distance = np.nan
+                right_distance = np.nan
+
+            results.append((keypoint_index, is_visible, inside_mask, left_distance, right_distance))
+
+        return np.array(
+            results,
+            dtype=[
+                ('keypoint_index', 'i4'),
+                ('is_visible', 'i4'),
+                ('inside_mask', 'i4'),
+                ('left_distance', 'f8'),
+                ('right_distance', 'f8'),
+            ],
+        )
+
+    def evaluate_keypoints_against_mask(
+        self,
+        mask: np.ndarray,
+        visibility_threshold: Optional[float] = 2.0,
+    ) -> np.ndarray:
+        """Evaluate all image keypoints against a binary mask.
+
+        Args:
+            mask: Binary mask with the same height and width as the image.
+            visibility_threshold: Optional visibility threshold. If provided,
+                hidden keypoints return ``inside_mask=0`` and ``NaN`` distances.
+
+        Returns:
+            Structured array with ``keypoint_index``, ``is_visible``, ``inside_mask``,
+            ``left_distance`` and ``right_distance``.
+        """
+        return YPImageValidation.compute_keypoint_mask_metrics(
+            keypoints=self.keypoints_norm,
+            mask=mask,
+            image_shape=(self.h, self.w),
+            visibility_threshold=visibility_threshold,
+        )
     
     @staticmethod
-    def _compute_lbp_value(neighborhood: np.ndarray) -> int:
-        """Compute LBP value for 3x3 neighborhood."""
-        center = neighborhood[1, 1]
-        binary_string = ""
-        neighbors = [
-            neighborhood[0, 0], neighborhood[0, 1], neighborhood[0, 2],
-            neighborhood[1, 2], neighborhood[2, 2], neighborhood[2, 1],
-            neighborhood[2, 0], neighborhood[1, 0]
-        ]
-        for neighbor in neighbors:
-            binary_string += "1" if neighbor >= center else "0"
-        return int(binary_string, 2)
+    def divide_distances_by_index(distances: np.ndarray) -> dict:
+        """
+        Divide distances into separate arrays organized by distance index.
+        
+        Groups structured distance array by the 'distance_index' field.
+        Returns a dictionary where keys are distance indices and values are
+        arrays containing all distances for that index.
+        
+        Args:
+            distances: Structured array with fields 'distance_index' (int) and 'distance' (float).
+                      Typically output from sequential_distances() or get_sequential_distances().
+        
+        Returns:
+            Dictionary mapping distance_index -> array of distance values
+            Keys are sorted distance indices found in the data.
+            
+        Example:
+            >>> validator = YPImageValidation(image, keypoints)
+            >>> distances = validator.sequential_distances()
+            >>> grouped = YPImageValidation.divide_distances_by_index(distances)
+            >>> print(grouped.keys())  # dict_keys([0, 1, 3, 5])
+            >>> print(grouped[0])      # array of distances at index 0
+            >>> print(grouped[1])      # array of distances at index 1
+        """
+        if len(distances) == 0:
+            return {}
+        
+        # Get unique indices and sort them
+        unique_indices = np.unique(distances['distance_index'])
+        
+        # Create dictionary grouping distances by index
+        grouped = {}
+        for idx in unique_indices:
+            mask = distances['distance_index'] == idx
+            grouped[int(idx)] = distances['distance'][mask]
+        
+        return grouped
+    
+    @staticmethod
+    def distances_by_index_to_matrix(distances: np.ndarray, fill_value: float = np.nan) -> tuple:
+        """
+        Convert grouped distances into a matrix format.
+        
+        Creates a 2D array where each column represents a distance index,
+        padded with fill_value where data is missing.
+        
+        Args:
+            distances: Structured array with 'distance_index' and 'distance' fields.
+            fill_value: Value to use for missing distances (default: np.nan).
+        
+        Returns:
+            Tuple of (matrix, indices) where:
+            - matrix: 2D array of shape (num_groups, num_indices) with distances
+            - indices: Array of distance indices corresponding to columns
+            
+        Example:
+            >>> distances = validator.sequential_distances()  # from single image
+            >>> matrix, indices = YPImageValidation.distances_by_index_to_matrix(distances)
+            >>> print(indices)   # [0, 1, 2, 3]
+            >>> print(matrix.shape)  # e.g., (17, 4) if 17 keypoints and 4 indices
+        """
+        if len(distances) == 0:
+            return np.array([], dtype=np.float64), np.array([], dtype=np.int64)
+        
+        grouped = YPImageValidation.divide_distances_by_index(distances)
+        
+        if not grouped:
+            return np.array([], dtype=np.float64), np.array([], dtype=np.int64)
+        
+        # Get sorted indices
+        sorted_indices = sorted(grouped.keys())
+        
+        # Find max length of any distance group
+        max_len = max(len(group) for group in grouped.values())
+        
+        # Create matrix with padding
+        matrix = np.full((max_len, len(sorted_indices)), fill_value, dtype=np.float64)
+        
+        for col_idx, dist_idx in enumerate(sorted_indices):
+            distances_for_index = grouped[dist_idx]
+            matrix[:len(distances_for_index), col_idx] = distances_for_index
+        
+        return matrix, np.array(sorted_indices, dtype=np.int64)
     
     @staticmethod
     def _patch_to_binary_decimal(patch: np.ndarray, center_value: float = None) -> dict:
@@ -155,43 +648,7 @@ class YPImageValidation:
             'patch_shape': patch.shape
         }
     
-    def _compute_lbp_histogram_single_internal(self, x: int, y: int, patch_size: int = 5) -> np.ndarray:
-        """Internal method to compute LBP histogram for single keypoint."""
-        half_size = patch_size // 2
-        
-        x_start = max(0, int(x) - half_size)
-        x_end = min(self.w, int(x) + half_size + 1)
-        y_start = max(0, int(y) - half_size)
-        y_end = min(self.h, int(y) + half_size + 1)
-        
-        patch = self.image[y_start:y_end, x_start:x_end].astype(np.uint8)
-        
-        if patch.shape[0] < 3 or patch.shape[1] < 3:
-            patch = np.pad(patch, ((half_size, half_size), (half_size, half_size)), mode='edge')
-        
-        lbp_map = np.zeros(patch.shape, dtype=np.uint8)
-        for py in range(1, patch.shape[0] - 1):
-            for px in range(1, patch.shape[1] - 1):
-                lbp_map[py, px] = self._compute_lbp_value(patch[py-1:py+2, px-1:px+2])
-        
-        hist, _ = np.histogram(lbp_map, bins=256, range=(0, 256))
-        return hist.astype(np.float32)
-    
-    def compute_lbp_histogram_single(self, x: int, y: int, patch_size: int = 5) -> np.ndarray:
-        """
-        Compute LBP histogram for single keypoint.
-        
-        Args:
-            x: X coordinate of keypoint
-            y: Y coordinate of keypoint
-            patch_size: Size of patch around keypoint
-            
-        Returns:
-            LBP histogram (256,)
-        """
-        return self._compute_lbp_histogram_single_internal(x, y, patch_size)
-    
-    def compute_lbp_decimal_single(self, x: int, y: int, patch_size: int = 5) -> np.uint64:
+    def compute_lbp_decimal_single(self, x: int, y: int, patch_size: int = 5) -> int:
         """
         Compute binary decimal representation for single keypoint.
         
@@ -201,173 +658,52 @@ class YPImageValidation:
             patch_size: Size of patch around keypoint
             
         Returns:
-            Binary decimal value (uint64)
+            Binary decimal value (arbitrary precision int)
         """
         half_size = patch_size // 2
         
         x_start = max(0, int(x) - half_size)
-        x_end = min(self.w, int(x) + half_size + 1)
         y_start = max(0, int(y) - half_size)
-        y_end = min(self.h, int(y) + half_size + 1)
+        
+        # For odd patch_size: include +1; for even: don't
+        if patch_size % 2 == 1:
+            x_end = min(self.w, int(x) + half_size + 1)
+            y_end = min(self.h, int(y) + half_size + 1)
+        else:
+            x_end = min(self.w, int(x) + half_size)
+            y_end = min(self.h, int(y) + half_size)
         
         patch = self.image[y_start:y_end, x_start:x_end].astype(np.uint8)
         
         if patch.size == 0:
             return np.uint64(0)
         
+        # Handle undersized patches by padding (for edge cases)
         if patch.shape[0] < patch_size or patch.shape[1] < patch_size:
             pad_h = patch_size - patch.shape[0]
             pad_w = patch_size - patch.shape[1]
             patch = np.pad(patch, ((0, pad_h), (0, pad_w)), mode='edge')
         
         result = self._patch_to_binary_decimal(patch)
-        return np.uint64(result['decimal'])
+        return int(result['decimal'])
     
-    def compute_lbp_histograms(self, patch_size: int = 5, visibility_threshold: float = 0.5) -> np.ndarray:
-        """
-        Compute LBP histograms for all visible keypoints in the image.
-        
-        Skips keypoints with visibility below threshold (hidden/occluded keypoints).
-        
-        Args:
-            patch_size: Size of patch around each keypoint
-            visibility_threshold: Minimum visibility score (0-1) to process a keypoint.
-                                Default 0.5. Keypoints below this are skipped.
-            
-        Returns:
-            Array of shape (N_visible, 256) - one histogram per visible keypoint.
-            N_visible <= N if keypoints include visibility information.
-        """
-        if self.keypoints.size == 0:
-            return np.zeros((0, 256), dtype=np.float32)
-        
-        # Filter by visibility if available
-        if self.keypoints.shape[1] >= 3:
-            visibility = self.keypoints[:, 2]
-            visible_indices = np.where(visibility >= visibility_threshold)[0]
-            coords = self.keypoints[visible_indices, :2]
-        else:
-            coords = self.keypoints
-        
-        lbp_features = np.zeros((len(coords), 256), dtype=np.float32)
-        for i, (x, y) in enumerate(coords):
-            lbp_features[i] = self.compute_lbp_histogram_single(int(x), int(y), patch_size)
-        
-        return lbp_features
-    
-    def compute_lbp_histograms_variable_radius(self, patch_size: int = 5, 
-                                               radius: int = 1, n_points: int = 8,
-                                               visibility_threshold: float = 0.5) -> np.ndarray:
-        """
-        Compute LBP histograms with variable radius for all visible keypoints.
-        
-        Skips keypoints with visibility below threshold (hidden/occluded keypoints).
-        
-        Args:
-            patch_size: Size of patch around each keypoint
-            radius: Radius of circular neighborhood
-            n_points: Number of sampling points
-            visibility_threshold: Minimum visibility score (0-1) to process a keypoint.
-                                Default 0.5. Keypoints below this are skipped.
-            
-        Returns:
-            Array of shape (N_visible, bins) - one histogram per visible keypoint.
-            N_visible <= N if keypoints include visibility information.
-        """
-        if self.keypoints.size == 0:
-            return np.zeros((0, 256), dtype=np.float32)
-        
-        # Filter by visibility if available
-        if self.keypoints.shape[1] >= 3:
-            visibility = self.keypoints[:, 2]
-            visible_indices = np.where(visibility >= visibility_threshold)[0]
-            coords = self.keypoints[visible_indices, :2]
-        else:
-            coords = self.keypoints
-        
-        max_val = 2 ** n_points
-        bins = 256
-        lbp_features = np.zeros((len(coords), bins), dtype=np.float32)
-        
-        for i, (x, y) in enumerate(coords):
-            x_int, y_int = int(x), int(y)
-            lbp_features[i] = self._compute_lbp_histogram_variable_radius_single(
-                x_int, y_int, radius, n_points, patch_size, bins
-            )
-        
-        return lbp_features
-    
-    @staticmethod
-    def _compute_lbp_value_variable_radius(image: np.ndarray, y: int, x: int,
-                                          radius: int = 1, n_points: int = 8) -> int:
-        """Compute LBP value using circular sampling at variable radius."""
-        h, w = image.shape[:2]
-        center_val = image[int(y), int(x)]
-        binary_string = ""
-        
-        for i in range(n_points):
-            angle = 2.0 * np.pi * i / n_points
-            px = int(x + radius * np.cos(angle))
-            py = int(y - radius * np.sin(angle))
-            
-            px = np.clip(px, 0, w - 1)
-            py = np.clip(py, 0, h - 1)
-            
-            neighbor_val = image[py, px]
-            binary_string += "1" if neighbor_val >= center_val else "0"
-        
-        return int(binary_string, 2)
-    
-    def _compute_lbp_histogram_variable_radius_single(self, x: int, y: int,
-                                                      radius: int, n_points: int,
-                                                      patch_size: int, bins: int) -> np.ndarray:
-        """Internal method for variable radius LBP histogram."""
-        half_size = patch_size // 2
-        
-        x_start = max(0, x - half_size)
-        x_end = min(self.w, x + half_size + 1)
-        y_start = max(0, y - half_size)
-        y_end = min(self.h, y + half_size + 1)
-        
-        patch = self.image[y_start:y_end, x_start:x_end].astype(np.uint8)
-        
-        if patch.shape[0] < 3 or patch.shape[1] < 3:
-            patch = np.pad(patch, ((half_size, half_size), (half_size, half_size)), mode='edge')
-        
-        lbp_map = np.zeros(patch.shape, dtype=np.uint32)
-        py_offset = y_start
-        px_offset = x_start
-        
-        for py in range(patch.shape[0]):
-            for px in range(patch.shape[1]):
-                img_y = py_offset + py
-                img_x = px_offset + px
-                if 0 <= img_y < self.h and 0 <= img_x < self.w:
-                    lbp_map[py, px] = self._compute_lbp_value_variable_radius(
-                        self.image, img_y, img_x, radius, n_points
-                    )
-        
-        max_val = 2 ** n_points
-        hist, _ = np.histogram(lbp_map, bins=bins, range=(0, min(bins, max_val)))
-        return hist.astype(np.float32)
-    
-    def compute_lbp_decimals(self, patch_size: int = 5, visibility_threshold: float = 0.5) -> np.ndarray:
+    def compute_lbp_decimals(self, patch_size: int = 5, visibility_threshold: float = 2.0) -> np.ndarray:
         """
         Compute binary decimal representations for all visible keypoints in the image.
         
-        Skips keypoints with visibility below threshold (hidden/occluded keypoints).
+        Skips keypoints with visibility below threshold (hidden/occluded/out-of-frame keypoints).
         
         Args:
             patch_size: Size of patch around each keypoint
-            visibility_threshold: Minimum visibility score (0-1) to process a keypoint.
-                                Default 0.5. Keypoints below this are skipped.
+            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
+                                Default 2.0 (only fully visible keypoints).
             
         Returns:
-            Array of shape (N_visible,) - uint64 values, one per visible keypoint.
+            Array of shape (N_visible,) - arbitrary precision int values, one per visible keypoint.
             N_visible <= N if keypoints include visibility information.
         """
         if self.keypoints.size == 0:
-            return np.array([], dtype=np.uint64)
+            return np.array([], dtype=object)
         
         # Filter by visibility if available
         if self.keypoints.shape[1] >= 3:
@@ -381,31 +717,36 @@ class YPImageValidation:
         for x, y in coords:
             decimal_values.append(self.compute_lbp_decimal_single(x, y, patch_size))
         
-        return np.array(decimal_values, dtype=np.uint64)
+        return np.array(decimal_values, dtype=object)
     
-    def draw_keypoints(self, color: tuple = (0, 255, 0)) -> np.ndarray:
+    def draw_keypoints(self, color: tuple = (0, 255, 0), keypoint_size: int = 4) -> np.ndarray:
         """
         Draw keypoints as circles on image.
         
         Args:
             color: RGB color tuple (R, G, B) in range [0, 255].
                   Default (0, 255, 0) for green.
+            keypoint_size: Radius of drawn keypoints in pixels.
         
         Returns:
             Image with keypoints drawn as circles
             
         Example:
             >>> validator = YPImageValidation(image, keypoints)
-            >>> result = validator.draw_keypoints(color=(0, 255, 0))
+            >>> result = validator.draw_keypoints(color=(0, 255, 0), keypoint_size=4)
             >>> cv2.imshow("With keypoints", result)
         """
         return YPImageValidation.draw_keypoints_on_image(
-            self.image, self.keypoints, color=color
+            self.image, self.keypoints, color=color, keypoint_size=keypoint_size
         )
     
     @staticmethod
-    def draw_keypoints_on_image(image: np.ndarray, keypoints: np.ndarray, 
-                               color: tuple = (0, 255, 0)) -> np.ndarray:
+    def draw_keypoints_on_image(
+        image: np.ndarray,
+        keypoints: np.ndarray,
+        color: tuple = (0, 255, 0),
+        keypoint_size: int = 4,
+    ) -> np.ndarray:
         """
         Draw keypoints as circles on image (static method).
         
@@ -415,14 +756,18 @@ class YPImageValidation:
             image: Image as numpy array (H x W or H x W x 3)
             keypoints: Array of keypoints (N, 2) with normalized [x, y] coordinates
             color: RGB color tuple (R, G, B) in range [0, 255]
+            keypoint_size: Radius of drawn keypoints in pixels.
         
         Returns:
             Image with keypoints drawn
             
         Example:
-            >>> result = YPImageValidation.draw_keypoints_on_image(image, keypoints, color=(0, 255, 0))
+            >>> result = YPImageValidation.draw_keypoints_on_image(
+            ...     image, keypoints, color=(0, 255, 0), keypoint_size=4
+            ... )
         """
         import copy
+
         result = copy.copy(image)
         h, w = image.shape[:2] if len(image.shape) >= 2 else (image.shape[0], image.shape[1])
         
@@ -432,7 +777,7 @@ class YPImageValidation:
         for (x, y) in keypoints[:, :2]:
             px = int(x * w)
             py = int(y * h)
-            cv2.circle(result, (px, py), 4, color, -1)
+            cv2.circle(result, (px, py), keypoint_size, color, -1)
         return result
     
     def draw_keypoints_with_patches(self, patch_size: int = 32,
@@ -482,9 +827,14 @@ class YPImageValidation:
         return result
     
     @classmethod
-    def load_keypoints(cls, label_path: str, include_visibility: bool = True) -> np.ndarray:
+    def load_keypoints(
+        cls,
+        label_path: str,
+        include_visibility: bool = True,
+        keypoint_format: str = "auto",
+    ) -> np.ndarray:
         """
-        Load keypoints from a single YOLO pose label file.
+        Load keypoints for the first person from a YOLO pose label file.
         
         Class method for loading keypoints without creating an instance.
         
@@ -492,9 +842,13 @@ class YPImageValidation:
             label_path: Path to .txt label file in YOLO pose format
             include_visibility: If True, returns (N, 3) with visibility.
                               If False, returns (N, 2) only coordinates.
+            keypoint_format: One of ``'auto'``, ``'xy'``, or ``'xyv'``.
+                ``'auto'`` detects whether labels store point pairs or
+                point-visibility triplets.
         
         Returns:
-            Array of keypoints (N, 2) or (N, 3) depending on include_visibility
+            Array of keypoints (N, 2) or (N, 3) for the first person only.
+            Use load_all_keypoints_from_file() to process every person in the image.
             
         Example:
             >>> keypoints = YPImageValidation.load_keypoints("image.txt")
@@ -511,20 +865,62 @@ class YPImageValidation:
         if not line:
             return np.array([])
         
-        # YOLO format: class_id x1 y1 v1 x2 y2 v2 ... xn yn vn
+        # YOLO Pose 1.0 format: class_id bbox_x bbox_y bbox_w bbox_h px1 py1 v1 px2 py2 v2 ... pxn pyn vn
         parts = line.split()
-        values = list(map(float, parts[1:]))  # Skip class_id
+        values = list(map(float, parts[5:]))  # Skip class_id, x, y, width, height (5 values total)
         
-        # Extract keypoints (every 3 values: x, y, visibility)
-        keypoints = []
-        for i in range(0, len(values), 3):
-            if i + 2 < len(values):
-                if include_visibility:
-                    keypoints.append([values[i], values[i+1], values[i+2]])
-                else:
-                    keypoints.append([values[i], values[i+1]])
+        return _parse_yolo_keypoint_values(values, include_visibility, keypoint_format)
+    
+    @classmethod
+    def load_all_keypoints_from_file(
+        cls,
+        label_path: str,
+        include_visibility: bool = True,
+        keypoint_format: str = "auto",
+    ) -> List[np.ndarray]:
+        """
+        Load ALL keypoints from a YOLO pose label file (one person per line).
         
-        return np.array(keypoints) if keypoints else np.array([])
+        Class method for loading multiple people from one label file.
+        
+        Args:
+            label_path: Path to .txt label file in YOLO pose format
+            include_visibility: If True, returns (N, 3) with visibility.
+                              If False, returns (N, 2) only coordinates.
+            keypoint_format: One of ``'auto'``, ``'xy'``, or ``'xyv'``.
+                ``'auto'`` detects whether labels store point pairs or
+                point-visibility triplets.
+        
+        Returns:
+            List of keypoint arrays, one per person. Each array is (N_keypoints, 2) or (N_keypoints, 3)
+            
+        Example:
+            >>> # Label file has 3 people
+            >>> all_kpts = YPImageValidation.load_all_keypoints_from_file("image.txt")
+            >>> print(len(all_kpts))  # 3
+            >>> print(all_kpts[0].shape)  # (9, 3) - first person, 9 keypoints
+        """
+        import os
+        
+        if not os.path.exists(label_path):
+            raise FileNotFoundError(f"Label file not found: {label_path}")
+        
+        all_keypoints = []
+        with open(label_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # YOLO Pose 1.0 format: class_id bbox_x bbox_y bbox_w bbox_h px1 py1 v1 px2 py2 v2 ... pxn pyn vn
+                parts = line.split()
+                values = list(map(float, parts[5:]))  # Skip class_id, x, y, width, height (5 values total)
+                
+                keypoints = _parse_yolo_keypoint_values(values, include_visibility, keypoint_format)
+                if keypoints.size > 0:
+                    all_keypoints.append(keypoints)
+        
+        return all_keypoints
 
     
     def visualize(self, patch_size: int = 5):
