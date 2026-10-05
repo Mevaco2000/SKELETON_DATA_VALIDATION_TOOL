@@ -5,6 +5,8 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Set, Tuple
+from urllib.parse import urlparse
+from urllib.request import urlretrieve
 
 try:
     import cv2
@@ -25,6 +27,19 @@ CACHE_DIR = APP_DIR / ".streamlit_cache"
 OUTPUT_ROOT = APP_DIR / "streamlit_outputs"
 
 
+def _is_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"}
+
+
+def _download_file(url: str, destination_dir: Path) -> Path:
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    file_name = Path(urlparse(url).path).name or "downloaded_file"
+    target = destination_dir / file_name
+    urlretrieve(url, str(target))
+    return target
+
+
 def _find_dataset_file(search_root: Path) -> Path:
     candidates = [
         "data.yaml",
@@ -40,6 +55,48 @@ def _find_dataset_file(search_root: Path) -> Path:
     raise FileNotFoundError(
         "Could not find data.yaml / dataset.yaml / train.txt in the provided dataset source."
     )
+
+
+def _find_dataset_files(search_root: Path) -> list[Path]:
+    candidates = [
+        "data.yaml",
+        "data.yml",
+        "dataset.yaml",
+        "dataset.yml",
+        "train.txt",
+    ]
+    matches: list[Path] = []
+    for candidate_name in candidates:
+        matches.extend(sorted(search_root.rglob(candidate_name)))
+    return matches
+
+
+def _normalize_extracted_root(extract_dir: Path, max_depth: int = 4) -> Path:
+    current = extract_dir
+    for _ in range(max_depth):
+        children = [child for child in current.iterdir() if child.is_dir()]
+        files = [child for child in current.iterdir() if child.is_file()]
+        has_dataset_markers = any(file.name.lower() in {"data.yaml", "data.yml", "dataset.yaml", "dataset.yml", "train.txt"} for file in files)
+        if has_dataset_markers:
+            return current
+        if len(children) == 1 and not files:
+            current = children[0]
+            continue
+        return current
+    return current
+
+
+def _generate_train_txt_if_possible(dataset_root: Path) -> Optional[Path]:
+    images_dir = dataset_root / "images"
+    labels_dir = dataset_root / "labels"
+    if not (images_dir.is_dir() and labels_dir.is_dir()):
+        return None
+    generated_train = YOLOPoseDataset.generate_train_txt_from_images(
+        dataset_root=str(dataset_root),
+        images_dir="images",
+        recursive=True,
+    )
+    return Path(generated_train)
 
 
 def _extract_uploaded_zip(uploaded_zip) -> Path:
@@ -62,12 +119,88 @@ def _extract_uploaded_zip(uploaded_zip) -> Path:
     with zipfile.ZipFile(zip_path, "r") as archive:
         archive.extractall(extract_dir)
 
-    return extract_dir
+    return _normalize_extracted_root(extract_dir)
+
+
+def _extract_zip_file(zip_path: Path) -> Path:
+    if zip_path.suffix.lower() != ".zip":
+        raise ValueError("Provided file is not a .zip archive.")
+
+    extract_dir = CACHE_DIR / "extracted" / zip_path.stem
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        archive.extractall(extract_dir)
+    return _normalize_extracted_root(extract_dir)
+
+
+def resolve_dataset_source(dataset_source: str) -> Path:
+    value = dataset_source.strip()
+    if not value:
+        raise ValueError("Provide a dataset path or URL.")
+
+    if _is_url(value):
+        downloaded_path = _download_file(value, CACHE_DIR / "downloads")
+        suffix = downloaded_path.suffix.lower()
+        if suffix == ".zip":
+            return _extract_zip_file(downloaded_path)
+        if suffix in {".yaml", ".yml", ".txt", ".json"}:
+            return downloaded_path
+        raise ValueError("The URL must point to a .zip, .yaml/.yml, .txt, or .json file.")
+
+    local_path = Path(value).expanduser().resolve()
+    if not local_path.exists():
+        raise FileNotFoundError(f"Path does not exist: {local_path}")
+
+    if local_path.is_file() and local_path.suffix.lower() == ".zip":
+        return _extract_zip_file(local_path)
+
+    if local_path.is_dir():
+        return local_path
+
+    if local_path.suffix.lower() in {".yaml", ".yml", ".txt", ".json"}:
+        return local_path
+
+    raise ValueError("Local source must be a directory, .zip, .yaml/.yml/.txt/.json file, or a valid URL.")
 
 
 def _resolve_yolo_dataset_file(dataset_source_path: Path) -> Path:
     if dataset_source_path.is_dir():
-        return _find_dataset_file(dataset_source_path)
+        normalized_root = _normalize_extracted_root(dataset_source_path)
+        candidate_files = _find_dataset_files(normalized_root)
+
+        generated_from_root = _generate_train_txt_if_possible(normalized_root)
+        if generated_from_root is not None:
+            candidate_files = [generated_from_root] + candidate_files
+
+        # Prefer files that produce at least one valid image/label pair.
+        for candidate in candidate_files:
+            try:
+                dataset = YOLOPoseDataset(str(candidate))
+                if len(dataset) > 0:
+                    return candidate
+            except Exception:
+                continue
+
+        # Secondary fallback: check nested directories for images/ + labels/ and generate train.txt.
+        for candidate_dir in sorted([p for p in normalized_root.rglob("*") if p.is_dir()]):
+            generated_train = _generate_train_txt_if_possible(candidate_dir)
+            if generated_train is None:
+                continue
+            try:
+                dataset = YOLOPoseDataset(str(generated_train))
+                if len(dataset) > 0:
+                    return generated_train
+            except Exception:
+                continue
+
+        # If descriptors exist but none were valid, return first one for a clear downstream error.
+        if candidate_files:
+            return candidate_files[0]
+
+        raise FileNotFoundError(
+            "Could not resolve a valid YOLO dataset from uploaded ZIP. "
+            "Expected data.yaml/dataset.yaml/train.txt or images/ and labels/ directories."
+        )
 
     if dataset_source_path.suffix.lower() in {".yaml", ".yml", ".txt"}:
         return dataset_source_path
@@ -448,6 +581,14 @@ with st.sidebar:
     st.header("Input")
 
     st.caption("Dataset source")
+    source_mode = st.radio(
+        "Source mode",
+        options=["Upload ZIP", "Path or URL"],
+        index=0,
+        help="Use ZIP upload for browser deployments or provide a direct server/local path/URL.",
+    )
+
+    dataset_source = ""
     uploaded_zip = st.file_uploader(
         "Upload dataset ZIP",
         type=["zip"],
@@ -455,9 +596,17 @@ with st.sidebar:
             "Upload a .zip archive containing your dataset. The archive should include at least one of: "
             "train.txt, data.yaml, or dataset.yaml (or files needed for selected input format conversion)."
         ),
+        disabled=source_mode != "Upload ZIP",
     )
 
-    st.caption("This app uses ZIP upload as the primary input mode.")
+    if source_mode == "Path or URL":
+        dataset_source = st.text_input(
+            "Dataset path or URL",
+            value="",
+            help="Accepted: local directory, local .zip/.yaml/.yml/.txt/.json, or URL to those files.",
+        )
+
+    st.caption("ZIP upload supports archives with one extra top-level folder.")
 
     top_k = st.number_input("Number of samples to review", min_value=1, max_value=5000, value=450, step=1)
     st.caption("How many highest-ranked samples should be saved and previewed.")
@@ -572,16 +721,22 @@ with st.sidebar:
 if run_button:
     adapter: Optional[KeypointDatasetAdapter] = None
     try:
-        if uploaded_zip is None:
-            st.error("Please upload a dataset ZIP file before running ranking.")
-            st.stop()
+        if source_mode == "Upload ZIP":
+            if uploaded_zip is None:
+                st.error("Please upload a dataset ZIP file before running ranking.")
+                st.stop()
 
         progress_placeholder = st.empty()
         progress_bar = st.progress(0, text="Starting...")
 
-        progress_placeholder.info("Step 1/5: Extracting uploaded dataset ZIP")
-        progress_bar.progress(10, text="Extracting ZIP")
-        dataset_source_path = _extract_uploaded_zip(uploaded_zip)
+        if source_mode == "Upload ZIP":
+            progress_placeholder.info("Step 1/5: Extracting uploaded dataset ZIP")
+            progress_bar.progress(10, text="Extracting ZIP")
+            dataset_source_path = _extract_uploaded_zip(uploaded_zip)
+        else:
+            progress_placeholder.info("Step 1/5: Resolving dataset source path")
+            progress_bar.progress(10, text="Resolving dataset source")
+            dataset_source_path = resolve_dataset_source(dataset_source)
 
         progress_placeholder.info("Step 2/5: Running merged ranking pipeline")
         progress_bar.progress(30, text="Running merged ranking pipeline")
