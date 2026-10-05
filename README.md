@@ -134,3 +134,12 @@ Including:
 - `top_k_ranked_paths.txt`
 - `annotated_top_k/`
 - `annotated_manifest.csv`
+
+### Streamlit Cloud deployment notes
+
+This repository includes two deployment helper files:
+
+- `runtime.txt` (pins Python to 3.11)
+- `packages.txt` (installs Linux system libs required by OpenCV)
+
+If you deploy on Streamlit Cloud and see an error like `ImportError: libGL.so.1`, redeploy after making sure these files are in the repository root.

@@ -8,7 +8,12 @@ from typing import Dict, Optional, Set, Tuple
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
 
-import cv2
+try:
+    import cv2
+    CV2_IMPORT_ERROR = None
+except Exception as import_error:
+    cv2 = None
+    CV2_IMPORT_ERROR = import_error
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -347,6 +352,15 @@ def render_preview(annotated_df: pd.DataFrame, preview_limit: int) -> None:
 
 
 st.set_page_config(page_title="A Unified Unsupervised Framework for Detecting Mislabeled Keypoints", layout="wide")
+
+if cv2 is None:
+    st.error(
+        "OpenCV could not be imported. On Linux/Streamlit Cloud install system packages in packages.txt "
+        "(for example: libgl1, libglib2.0-0)."
+    )
+    st.code(f"OpenCV import error: {CV2_IMPORT_ERROR}")
+    st.stop()
+
 st.title("A Unified Unsupervised Framework for Detecting Mislabeled Keypoints")
 
 SEGMENTATION_CLASS_OPTIONS = {
