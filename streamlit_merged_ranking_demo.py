@@ -4,9 +4,7 @@ import os
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
-from urllib.request import urlretrieve
+from typing import Dict, Optional, Set, Tuple
 
 try:
     import cv2
@@ -27,19 +25,6 @@ CACHE_DIR = APP_DIR / ".streamlit_cache"
 OUTPUT_ROOT = APP_DIR / "streamlit_outputs"
 
 
-def _is_url(value: str) -> bool:
-    parsed = urlparse(value)
-    return parsed.scheme in {"http", "https"}
-
-
-def _download_file(url: str, destination_dir: Path) -> Path:
-    destination_dir.mkdir(parents=True, exist_ok=True)
-    file_name = Path(urlparse(url).path).name or "downloaded_file"
-    target = destination_dir / file_name
-    urlretrieve(url, str(target))
-    return target
-
-
 def _find_dataset_file(search_root: Path) -> Path:
     candidates = [
         "data.yaml",
@@ -57,77 +42,27 @@ def _find_dataset_file(search_root: Path) -> Path:
     )
 
 
-def _looks_like_dataset_dir(path: Path) -> bool:
-    marker_files = {"data.yaml", "data.yml", "dataset.yaml", "dataset.yml", "train.txt"}
-    try:
-        child_names = {child.name.lower() for child in path.iterdir()}
-    except Exception:
-        return False
+def _extract_uploaded_zip(uploaded_zip) -> Path:
+    if uploaded_zip is None:
+        raise ValueError("Please upload a dataset ZIP file.")
 
-    if child_names & marker_files:
-        return True
+    if not str(uploaded_zip.name).lower().endswith(".zip"):
+        raise ValueError("Uploaded file must be a .zip archive.")
 
-    has_images = "images" in child_names
-    has_labels = "labels" in child_names
-    has_annotations = "annotations" in child_names
-    return (has_images and has_labels) or has_annotations
+    upload_dir = CACHE_DIR / "uploaded_archives"
+    upload_dir.mkdir(parents=True, exist_ok=True)
 
+    unique_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{Path(uploaded_zip.name).name}"
+    zip_path = upload_dir / unique_name
+    with open(zip_path, "wb") as zip_handle:
+        zip_handle.write(uploaded_zip.getbuffer())
 
-def _list_candidate_dataset_dirs(base_dir: Path, max_depth: int = 3, max_results: int = 300) -> List[str]:
-    if not base_dir.exists() or not base_dir.is_dir():
-        return []
+    extract_dir = CACHE_DIR / "extracted" / Path(unique_name).stem
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        archive.extractall(extract_dir)
 
-    base_dir = base_dir.resolve()
-    base_depth = len(base_dir.parts)
-    candidates: List[str] = []
-
-    for root, dirs, _ in os.walk(base_dir):
-        root_path = Path(root)
-        depth = len(root_path.parts) - base_depth
-        if depth > max_depth:
-            dirs[:] = []
-            continue
-
-        if _looks_like_dataset_dir(root_path):
-            candidates.append(str(root_path))
-            if len(candidates) >= max_results:
-                break
-
-    return sorted(set(candidates))
-
-
-def resolve_dataset_source(dataset_source: str) -> Path:
-    value = dataset_source.strip()
-    if not value:
-        raise ValueError("Provide a dataset path or URL.")
-
-    if _is_url(value):
-        downloaded_path = _download_file(value, CACHE_DIR / "downloads")
-        suffix = downloaded_path.suffix.lower()
-
-        if suffix == ".zip":
-            extract_dir = CACHE_DIR / "extracted" / downloaded_path.stem
-            extract_dir.mkdir(parents=True, exist_ok=True)
-            with zipfile.ZipFile(downloaded_path, "r") as archive:
-                archive.extractall(extract_dir)
-            return extract_dir
-
-        if suffix in {".yaml", ".yml", ".txt", ".json"}:
-            return downloaded_path
-
-        raise ValueError("The URL must point to a .zip, .yaml/.yml, .txt, or .json file.")
-
-    local_path = Path(value).expanduser().resolve()
-    if not local_path.exists():
-        raise FileNotFoundError(f"Path does not exist: {local_path}")
-
-    if local_path.is_dir():
-        return local_path
-
-    if local_path.suffix.lower() in {".yaml", ".yml", ".txt", ".json"}:
-        return local_path
-
-    raise ValueError("Local source must be a directory or a .yaml/.yml/.txt/.json file.")
+    return extract_dir
 
 
 def _resolve_yolo_dataset_file(dataset_source_path: Path) -> Path:
@@ -240,7 +175,6 @@ def run_ranking(
     dataset_source_path: Path,
     source_format: str,
     copy_images: bool,
-    use_ultralytics_for_coco: bool,
     coco_annotations_dir: str,
     coco_images_dir: str,
     top_k: int,
@@ -265,7 +199,7 @@ def run_ranking(
             "source_format": source_format,
             "input_root": input_root,
             "copy_images": copy_images,
-            "use_ultralytics_for_coco": use_ultralytics_for_coco,
+            "use_ultralytics_for_coco": True,
             "coco_annotations_dir": coco_annotations_dir.strip() or None,
             "coco_images_dir": coco_images_dir.strip() or None,
         }
@@ -514,200 +448,123 @@ with st.sidebar:
     st.header("Input")
 
     st.caption("Dataset source")
-    dataset_source_mode = st.radio(
-        "How do you want to provide input data?",
-        options=["Path or URL", "Pick folder on app server", "Upload ZIP from your computer"],
-        index=0,
+    uploaded_zip = st.file_uploader(
+        "Upload dataset ZIP",
+        type=["zip"],
         help=(
-            "Path or URL: manual path/URL. Pick folder on app server: choose a folder visible to the running app process. "
-            "Upload ZIP from your computer: upload a dataset archive directly from your local machine."
+            "Upload a .zip archive containing your dataset. The archive should include at least one of: "
+            "train.txt, data.yaml, or dataset.yaml (or files needed for selected input format conversion)."
         ),
     )
 
-    st.info(
-        "In browser deployments (for example Streamlit Cloud), apps cannot directly browse your local disk folders. "
-        "Use 'Upload ZIP from your computer' or run the app locally to use direct folder paths."
-    )
+    st.caption("This app uses ZIP upload as the primary input mode.")
 
-    dataset_source = ""
-    if dataset_source_mode == "Path or URL":
-        dataset_source = st.text_input(
-            "Dataset path or URL",
+    top_k = st.number_input("Number of samples to review", min_value=1, max_value=5000, value=450, step=1)
+    st.caption("How many highest-ranked samples should be saved and previewed.")
+
+    with st.expander("More settings", expanded=False):
+        format_options = FORMAT_REGISTRY.list_formats()
+        default_format_index = format_options.index("yolo_pose") if "yolo_pose" in format_options else 0
+        source_format = st.selectbox(
+            "Input dataset format",
+            options=format_options,
+            index=default_format_index,
+            help="Select the format of your source dataset. Non-YOLO formats are converted internally.",
+        )
+
+        copy_images = st.checkbox(
+            "Copy images during conversion",
+            value=True,
+            help="For non-YOLO formats: copy image files into the temporary YOLO-converted dataset.",
+        )
+
+        coco_annotations_dir = st.text_input(
+            "COCO annotations directory (optional override)",
             value="",
-            help=(
-                "Accepted values: local directory, local file (.yaml/.yml/.txt/.json), or URL to .zip/.yaml/.yml/.txt/.json. "
-                "Examples: /data/my_dataset, C:/datasets/pose/train.txt, https://.../dataset.zip"
-            ),
+            disabled=source_format != "coco_keypoints",
+            help="Directory with COCO keypoints annotation JSON files. Leave empty to auto-resolve from dataset source.",
+        )
+        coco_images_dir = st.text_input(
+            "COCO images directory (optional)",
+            value="",
+            disabled=source_format != "coco_keypoints",
+            help="Optional path to source images to copy into converted YOLO dataset.",
         )
 
-    elif dataset_source_mode == "Pick folder on app server":
-        default_scan_root = str(APP_DIR)
-        scan_root_input = st.text_input(
-            "Scan root directory",
-            value=default_scan_root,
-            help="Directory to scan for dataset folders (contains train.txt / data.yaml / dataset.yaml / images+labels).",
+        st.subheader("Ranking weights")
+        distance_weight = st.number_input("distance_weight", value=1.0, step=0.1, format="%.3f", help="Weight for distance-based anomaly score.")
+        lbp_weight = st.number_input("lbp_weight", value=1.0, step=0.1, format="%.3f", help="Weight for LBP texture-based anomaly score.")
+        segmentation_weight = st.number_input("segmentation_weight", value=1.0, step=0.1, format="%.3f", help="Weight for segmentation-based score.")
+
+        st.subheader("Distance")
+        distance_model_name = st.selectbox(
+            "distance_model_name",
+            options=[
+                "random_forest",
+                "hist_gradient_boosting",
+                "gradient_boosting",
+                "linear",
+                "ridge",
+                "lasso",
+                "elasticnet",
+                "bayesian_ridge",
+                "huber",
+                "ransac",
+                "svr",
+                "decision_tree",
+                "knn",
+                "mlp",
+            ],
+            index=0,
+            help="Regression model used to estimate keypoint-distance error.",
         )
-        scan_root_path = Path(scan_root_input).expanduser()
-        folder_candidates = _list_candidate_dataset_dirs(scan_root_path)
+        distance_sort_by = st.selectbox("distance_sort_by", options=["mean", "max"], index=0, help="How per-sample distance errors are aggregated.")
 
-        if folder_candidates:
-            dataset_source = st.selectbox(
-                "Select dataset folder",
-                options=folder_candidates,
-                help="Choose one detected dataset folder.",
-            )
-        else:
-            st.warning("No dataset-like folders found under the selected scan root.")
-            dataset_source = st.text_input(
-                "Fallback dataset path",
-                value="",
-                help="Enter a directory path manually if automatic detection found no candidates.",
-            )
-
-    else:
-        uploaded_zip = st.file_uploader(
-            "Upload dataset ZIP",
-            type=["zip"],
-            help="Upload a ZIP that contains data.yaml/dataset.yaml/train.txt or a valid dataset folder structure.",
+        st.subheader("Segmentation")
+        use_segmentation = st.checkbox("Enable segmentation", value=True, help="If disabled, segmentation contribution is ignored.")
+        segmentation_model_name = st.selectbox(
+            "segmentation_model_name",
+            options=[
+                "yolo26n-seg",
+                "yolo26s-seg",
+                "yolo26m-seg",
+                "yolo26l-seg",
+                "yolo26x-seg",
+                "maskrcnn_resnet50_fpn",
+                "deeplabv3_resnet50",
+                "lraspp_mobilenet_v3_large",
+                "fcn_resnet50",
+            ],
+            index=2,
+            disabled=not use_segmentation,
+            help="Segmentation model used to build mask-based validation signals.",
         )
-        if uploaded_zip is not None:
-            upload_dir = CACHE_DIR / "uploaded_archives"
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            target_zip_path = upload_dir / uploaded_zip.name
-            with open(target_zip_path, "wb") as zip_handle:
-                zip_handle.write(uploaded_zip.getbuffer())
-            dataset_source = str(target_zip_path)
-            st.info(f"Uploaded archive saved to: {target_zip_path}")
-
-    with st.expander("What does 'Dataset path or URL' mean?", expanded=False):
-        st.markdown(
-            "- A **directory** containing your dataset files.\n"
-            "- A **YOLO file** such as `train.txt`, `data.yaml`, or `dataset.yaml`.\n"
-            "- A **COCO JSON file** or directory (when `Input dataset format` is `coco_keypoints`).\n"
-            "- A **remote URL** to `.zip`, `.yaml`, `.yml`, `.txt`, or `.json`."
+        class_options = SEGMENTATION_CLASS_OPTIONS.get(segmentation_model_name, ["person"])
+        default_class_index = class_options.index("person") if "person" in class_options else 0
+        segmentation_target_class = st.selectbox(
+            "segmentation_target_class",
+            options=class_options,
+            index=default_class_index,
+            disabled=not use_segmentation,
+            help="Target class that defines object masks for keypoint-inside/outside checks.",
         )
-
-    with st.expander("Why can't I pick a local folder in Streamlit Cloud?", expanded=False):
-        st.markdown(
-            "Browser-based apps do not get direct access to your local filesystem paths for security reasons.\n"
-            "Use one of these options:\n"
-            "- Upload a ZIP archive from your computer.\n"
-            "- Host data on a URL and paste the link.\n"
-            "- Run the app locally and use direct paths/folder selection."
+        segmentation_score_threshold = st.number_input(
+            "segmentation_score_threshold",
+            value=0.5,
+            step=0.05,
+            format="%.2f",
+            disabled=not use_segmentation,
+            help="Minimum confidence score for accepted segmentation masks.",
         )
-
-    format_options = FORMAT_REGISTRY.list_formats()
-    default_format_index = format_options.index("yolo_pose") if "yolo_pose" in format_options else 0
-    source_format = st.selectbox(
-        "Input dataset format",
-        options=format_options,
-        index=default_format_index,
-        help="Select the format of your source dataset. Non-YOLO formats are converted internally.",
-    )
-
-    copy_images = st.checkbox(
-        "Copy images during conversion",
-        value=True,
-        help="For non-YOLO formats: copy image files into the temporary YOLO-converted dataset.",
-    )
-
-    use_ultralytics_for_coco = st.checkbox(
-        "Use Ultralytics COCO converter",
-        value=True,
-        disabled=source_format != "coco_keypoints",
-        help="For coco_keypoints: use ultralytics.data.converter.convert_coco before ranking.",
-    )
-
-    coco_annotations_dir = st.text_input(
-        "COCO annotations directory (optional override)",
-        value="",
-        disabled=source_format != "coco_keypoints",
-        help="Directory with COCO keypoints annotation JSON files. Leave empty to auto-resolve from dataset source.",
-    )
-    coco_images_dir = st.text_input(
-        "COCO images directory (optional)",
-        value="",
-        disabled=source_format != "coco_keypoints",
-        help="Optional path to source images to copy into converted YOLO dataset.",
-    )
-
-    top_k = st.number_input("top_k", min_value=1, max_value=5000, value=450, step=1)
-    st.caption("top_k = number of highest-ranked entries saved and previewed.")
-
-    st.subheader("Ranking weights")
-    distance_weight = st.number_input("distance_weight", value=1.0, step=0.1, format="%.3f", help="Weight for distance-based anomaly score.")
-    lbp_weight = st.number_input("lbp_weight", value=1.0, step=0.1, format="%.3f", help="Weight for LBP texture-based anomaly score.")
-    segmentation_weight = st.number_input("segmentation_weight", value=1.0, step=0.1, format="%.3f", help="Weight for segmentation-based score.")
-
-    st.subheader("Distance")
-    distance_model_name = st.selectbox(
-        "distance_model_name",
-        options=[
-            "random_forest",
-            "hist_gradient_boosting",
-            "gradient_boosting",
-            "linear",
-            "ridge",
-            "lasso",
-            "elasticnet",
-            "bayesian_ridge",
-            "huber",
-            "ransac",
-            "svr",
-            "decision_tree",
-            "knn",
-            "mlp",
-        ],
-        index=0,
-        help="Regression model used to estimate keypoint-distance error.",
-    )
-    distance_sort_by = st.selectbox("distance_sort_by", options=["mean", "max"], index=0, help="How per-sample distance errors are aggregated.")
-
-    st.subheader("Segmentation")
-    use_segmentation = st.checkbox("Enable segmentation", value=True, help="If disabled, segmentation contribution is ignored.")
-    segmentation_model_name = st.selectbox(
-        "segmentation_model_name",
-        options=[
-            "yolo26n-seg",
-            "yolo26s-seg",
-            "yolo26m-seg",
-            "yolo26l-seg",
-            "yolo26x-seg",
-            "maskrcnn_resnet50_fpn",
-            "deeplabv3_resnet50",
-            "lraspp_mobilenet_v3_large",
-            "fcn_resnet50",
-        ],
-        index=2,
-        disabled=not use_segmentation,
-        help="Segmentation model used to build mask-based validation signals.",
-    )
-    class_options = SEGMENTATION_CLASS_OPTIONS.get(segmentation_model_name, ["person"])
-    default_class_index = class_options.index("person") if "person" in class_options else 0
-    segmentation_target_class = st.selectbox(
-        "segmentation_target_class",
-        options=class_options,
-        index=default_class_index,
-        disabled=not use_segmentation,
-        help="Target class that defines object masks for keypoint-inside/outside checks.",
-    )
-    segmentation_score_threshold = st.number_input(
-        "segmentation_score_threshold",
-        value=0.5,
-        step=0.05,
-        format="%.2f",
-        disabled=not use_segmentation,
-        help="Minimum confidence score for accepted segmentation masks.",
-    )
-    segmentation_mask_tolerance_px = st.number_input(
-        "segmentation_mask_tolerance_px",
-        min_value=0,
-        max_value=100,
-        value=12,
-        step=1,
-        disabled=not use_segmentation,
-        help="Allowed pixel margin when testing whether a keypoint is outside a mask.",
-    )
+        segmentation_mask_tolerance_px = st.number_input(
+            "segmentation_mask_tolerance_px",
+            min_value=0,
+            max_value=100,
+            value=12,
+            step=1,
+            disabled=not use_segmentation,
+            help="Allowed pixel margin when testing whether a keypoint is outside a mask.",
+        )
 
     run_button = st.button("Run ranking", type="primary")
 
@@ -715,12 +572,16 @@ with st.sidebar:
 if run_button:
     adapter: Optional[KeypointDatasetAdapter] = None
     try:
+        if uploaded_zip is None:
+            st.error("Please upload a dataset ZIP file before running ranking.")
+            st.stop()
+
         progress_placeholder = st.empty()
         progress_bar = st.progress(0, text="Starting...")
 
-        progress_placeholder.info("Step 1/5: Resolving dataset source")
-        progress_bar.progress(10, text="Resolving dataset source")
-        dataset_source_path = resolve_dataset_source(dataset_source)
+        progress_placeholder.info("Step 1/5: Extracting uploaded dataset ZIP")
+        progress_bar.progress(10, text="Extracting ZIP")
+        dataset_source_path = _extract_uploaded_zip(uploaded_zip)
 
         progress_placeholder.info("Step 2/5: Running merged ranking pipeline")
         progress_bar.progress(30, text="Running merged ranking pipeline")
@@ -732,7 +593,6 @@ if run_button:
             dataset_source_path=dataset_source_path,
             source_format=source_format,
             copy_images=copy_images,
-            use_ultralytics_for_coco=use_ultralytics_for_coco,
             coco_annotations_dir=coco_annotations_dir,
             coco_images_dir=coco_images_dir,
             top_k=int(top_k),
@@ -756,7 +616,7 @@ if run_button:
         faulty_lookup = _build_faulty_keypoint_lookup(evaluator)
         mask_lookup = _build_mask_lookup(evaluator)
 
-        progress_placeholder.info("Step 4/5: Saving annotated top-k outputs")
+        progress_placeholder.info("Step 4/5: Saving annotated top outputs")
         progress_bar.progress(70, text="Saving annotated outputs")
 
         def _save_progress(current: int, total: int) -> None:
@@ -786,7 +646,7 @@ if run_button:
         st.write(f"Output dir: {run_dir}")
 
         ranking_df = pd.DataFrame(ranking_rows)
-        st.subheader("Ranking (top_k)")
+        st.subheader(f"Ranking (top {int(top_k)})")
         st.dataframe(ranking_df.head(int(top_k)), use_container_width=True)
 
         if not annotated_df.empty:
