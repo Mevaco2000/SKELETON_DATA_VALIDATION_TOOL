@@ -479,7 +479,7 @@ def render_preview(annotated_df: pd.DataFrame, preview_limit: int) -> None:
             f"rank={int(row['rank'])} | person_id={int(row['person_id'])} "
             f"| outside_keypoint_count={int(row['outside_keypoint_count'])}"
         )
-        st.image(image_rgb, caption=caption, use_container_width=True)
+        st.image(image_rgb, caption=caption, width='stretch')
 
 
 st.set_page_config(page_title="A Unified Unsupervised Framework for Detecting Mislabeled Keypoints", layout="wide")
@@ -836,11 +836,11 @@ if run_button:
 
         ranking_df = pd.DataFrame(ranking_rows)
         st.subheader(f"Ranking (top {int(top_k)})")
-        st.dataframe(ranking_df.head(int(top_k)), use_container_width=True)
+        st.dataframe(ranking_df.head(int(top_k)), width='stretch')
 
         if not annotated_df.empty:
             st.subheader("Output files")
-            st.dataframe(annotated_df, use_container_width=True)
+            st.dataframe(annotated_df, width='stretch')
 
         preview_default = min(10, int(top_k))
         preview_limit = st.slider(
