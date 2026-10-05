@@ -22,10 +22,11 @@ Core modules are under `utils/`:
 
 ## 2. Installation
 
-Example setup (Windows PowerShell):
+Clone and install (Windows PowerShell):
 
 ```powershell
-cd <repo-path>/Skrypty/github
+git clone https://github.com/Mevaco2000/YOLO_POSE_Data_Validation.git
+cd YOLO_POSE_Data_Validation
 
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
@@ -33,6 +34,8 @@ python -m venv .venv
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
+
+If you downloaded a ZIP instead of cloning, extract it and run the same commands from the project root directory (the folder that contains `README.md`, `requirements.txt`, and `utils/`).
 
 Notes:
 
@@ -131,21 +134,3 @@ Including:
 - `top_k_ranked_paths.txt`
 - `annotated_top_k/`
 - `annotated_manifest.csv`
-
-## 7. Key files
-
-- `test_validation_smoke.py` for integration/smoke checks
-- `streamlit_merged_ranking_demo.py` for interactive ranking
-- `utils/validation/` for validation and ranking logic
-- `utils/datasets/` for formats and conversion logic
-
-## 8. Common issues
-
-1. Import errors (`ModuleNotFoundError`):
-   Run commands from `Skrypty/github` and ensure the correct environment is active.
-
-2. FAISS/PyTorch incompatibility:
-   Install CPU/GPU builds matching your system and CUDA runtime.
-
-3. Segmentation model issues:
-   Disable segmentation or select a compatible model.
