@@ -330,7 +330,7 @@ class MergedRankingEvaluator:
             f"avg_rank_all={avg_rank_text}"
         )
 
-    def _prepare(self):
+    def _prepare(self, include_distance: bool = True, include_lbp: bool = True, include_segmentation: bool = True):
         if self._prepared:
             return
 
@@ -339,30 +339,34 @@ class MergedRankingEvaluator:
         self.merged_reference_image_paths = self._build_reference_image_path_set(self.reference_report_entries["merged"])
         self.merged_reference_image_names = self._build_reference_image_name_set(self.reference_report_entries["merged"])
 
-        self.results_distance = globals().get("results_distance")
-        if self.results_distance is None:
-            distance_model, valid_indices = self.validator.train_distance_models(
-                self.distance_model_name,
-                distance_connections=self.distance_connections,
-                visibility_threshold=self.distance_visibility_threshold,
-            )
-            self.results_distance = self.validator.predict_distance_anomalies(
-                distance_model,
-                valid_indices,
-                distance_connections=self.distance_connections,
-                visibility_threshold=self.distance_visibility_threshold,
-                threshold_percentile=self.distance_threshold_percentile,
-                sort_by=self.distance_sort_by,
-            )
+        self.results_distance = []
+        if include_distance:
+            self.results_distance = globals().get("results_distance")
+            if self.results_distance is None:
+                distance_model, valid_indices = self.validator.train_distance_models(
+                    self.distance_model_name,
+                    distance_connections=self.distance_connections,
+                    visibility_threshold=self.distance_visibility_threshold,
+                )
+                self.results_distance = self.validator.predict_distance_anomalies(
+                    distance_model,
+                    valid_indices,
+                    distance_connections=self.distance_connections,
+                    visibility_threshold=self.distance_visibility_threshold,
+                    threshold_percentile=self.distance_threshold_percentile,
+                    sort_by=self.distance_sort_by,
+                )
 
-        self.results_lbp = globals().get("results_lbp")
-        if self.results_lbp is None:
-            self.results_lbp = self.validator.predict_lbp_anomalies_by_embedding_groups(patch_size=32)
+        self.results_lbp = []
+        if include_lbp:
+            self.results_lbp = globals().get("results_lbp")
+            if self.results_lbp is None:
+                self.results_lbp = self.validator.predict_lbp_anomalies_by_embedding_groups(patch_size=32)
 
         self.segmentation_masks = globals().get("masks")
         self.outside_keypoints = globals().get("outside_keypoints")
         self.results_mask_distance = globals().get("results_mask_distance")
-        if self._is_segmentation_disabled(self.segmentation_model_name):
+        if (not include_segmentation) or self._is_segmentation_disabled(self.segmentation_model_name):
             self.segmentation_masks = {
                 "masks": [],
                 "image_paths": [],
@@ -552,7 +556,15 @@ class MergedRankingEvaluator:
 
     # Public entrypoint
     def run(self, distance_weight, lbp_weight, segmentation_weight):
-        self._prepare()
+        include_distance = float(distance_weight) > 0.0
+        include_lbp = float(lbp_weight) > 0.0
+        include_segmentation = float(segmentation_weight) > 0.0
+
+        self._prepare(
+            include_distance=include_distance,
+            include_lbp=include_lbp,
+            include_segmentation=include_segmentation,
+        )
         combined_ranking, ranking_meta = self._build_combined_ranking(
             distance_weight,
             lbp_weight,

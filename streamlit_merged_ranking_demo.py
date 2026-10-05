@@ -659,8 +659,8 @@ with st.sidebar:
 
         st.subheader("Ranking weights")
         distance_weight = st.number_input("distance_weight", value=1.0, step=0.1, format="%.3f", help="Weight for distance-based anomaly score.")
-        lbp_weight = st.number_input("lbp_weight", value=1.0, step=0.1, format="%.3f", help="Weight for LBP texture-based anomaly score.")
-        segmentation_weight = st.number_input("segmentation_weight", value=1.0, step=0.1, format="%.3f", help="Weight for segmentation-based score.")
+        lbp_weight = st.number_input("lbp_weight", value=0.0, step=0.1, format="%.3f", help="Weight for LBP texture-based anomaly score. Set to 0 to skip CLIP embedding stage.")
+        segmentation_weight = st.number_input("segmentation_weight", value=0.0, step=0.1, format="%.3f", help="Weight for segmentation-based score. Set to 0 to skip segmentation stage.")
 
         st.subheader("Distance")
         distance_model_name = st.selectbox(

@@ -4,6 +4,7 @@ import os
 import math
 import shutil
 import tempfile
+import warnings
 from typing import List, Tuple, Optional, Union, Callable, Dict, Any, Sequence
 import numpy as np
 import cv2
@@ -126,6 +127,8 @@ COCO_DETECTION_CLASS_LOOKUP = _build_class_lookup(COCO_DETECTION_CATEGORIES)
 VOC_SEGMENTATION_CLASS_LOOKUP = _build_class_lookup(VOC_SEGMENTATION_CLASSES)
 COCO_YOLO_CLASS_LOOKUP = _build_class_lookup(COCO_YOLO_CLASSES)
 
+_CLIP_MODEL_CACHE: Dict[Tuple[str, str, str], Tuple[Any, Any]] = {}
+
 
 # ==================== CLIP-based Embedding Functions ====================
 
@@ -138,13 +141,43 @@ def _load_clip_model(device: str) -> Tuple:
     Returns:
         Tuple of (model, preprocess) for CLIP
     """
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        CLIP_MODEL_NAME,
-        pretrained=CLIP_MODEL_PRETRAINED
+    model_name = CLIP_MODEL_NAME
+    pretrained_tag = CLIP_MODEL_PRETRAINED
+
+    # OpenAI checkpoints are trained with QuickGELU; prefer the matching arch
+    # to avoid mismatch warnings and extra compatibility overhead.
+    candidate_model_names = [model_name]
+    if pretrained_tag == "openai" and not model_name.endswith("-quickgelu"):
+        candidate_model_names = [f"{model_name}-quickgelu", model_name]
+
+    for candidate_name in candidate_model_names:
+        cache_key = (device, candidate_name, pretrained_tag)
+        cached = _CLIP_MODEL_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r".*QuickGELU mismatch.*",
+                    category=UserWarning,
+                )
+                model, _, preprocess = open_clip.create_model_and_transforms(
+                    candidate_name,
+                    pretrained=pretrained_tag,
+                )
+            model = model.to(device)
+            model.eval()
+            _CLIP_MODEL_CACHE[cache_key] = (model, preprocess)
+            return model, preprocess
+        except Exception:
+            continue
+
+    # Keep a clear error if both preferred and fallback variants fail.
+    raise RuntimeError(
+        f"Failed to load OpenCLIP model '{CLIP_MODEL_NAME}' with pretrained='{CLIP_MODEL_PRETRAINED}'."
     )
-    model = model.to(device)
-    model.eval()
-    return model, preprocess
 
 
  
