@@ -112,7 +112,13 @@ def _extract_uploaded_zip(uploaded_zip) -> Path:
     unique_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{Path(uploaded_zip.name).name}"
     zip_path = upload_dir / unique_name
     with open(zip_path, "wb") as zip_handle:
-        zip_handle.write(uploaded_zip.getbuffer())
+        uploaded_zip.seek(0)
+        while True:
+            chunk = uploaded_zip.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            zip_handle.write(chunk)
+        uploaded_zip.seek(0)
 
     extract_dir = CACHE_DIR / "extracted" / Path(unique_name).stem
     extract_dir.mkdir(parents=True, exist_ok=True)

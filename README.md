@@ -141,5 +141,11 @@ This repository includes two deployment helper files:
 
 - `runtime.txt` (pins Python to 3.11)
 - `packages.txt` (installs Linux system libs required by OpenCV)
+- `.streamlit/config.toml` (raises Streamlit upload/message limits for larger ZIP datasets)
 
 If you deploy on Streamlit Cloud and see an error like `ImportError: libGL.so.1`, redeploy after making sure these files are in the repository root.
+
+If your dataset ZIP is large (for example ~150 MB or more), make sure `.streamlit/config.toml` is present in the repository root and redeploy so Streamlit applies:
+
+- `server.maxUploadSize = 1024`
+- `server.maxMessageSize = 1024`
