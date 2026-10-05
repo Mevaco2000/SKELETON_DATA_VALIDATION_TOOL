@@ -33,6 +33,14 @@ python -m venv .venv
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
+If PowerShell blocks activation with `running scripts is disabled on this system`, run:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
+
+This change affects only the current PowerShell session.
 
 If you downloaded a ZIP instead of cloning, extract it and run the same commands from the project root directory (the folder that contains `README.md`, `requirements.txt`, and `utils/`).
 

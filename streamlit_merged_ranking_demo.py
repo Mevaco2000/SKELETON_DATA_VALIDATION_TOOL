@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Set, Tuple
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
+from uuid import uuid4
 
 try:
     import cv2
@@ -110,8 +111,9 @@ def _extract_uploaded_zip(uploaded_zip) -> Path:
     upload_dir = CACHE_DIR / "uploaded_archives"
     upload_dir.mkdir(parents=True, exist_ok=True)
 
-    unique_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{Path(uploaded_zip.name).name}"
-    zip_path = upload_dir / unique_name
+    # Keep cache names intentionally short to avoid Windows path length issues.
+    short_token = uuid4().hex[:10]
+    zip_path = upload_dir / f"upload_{short_token}.zip"
     with open(zip_path, "wb") as zip_handle:
         uploaded_zip.seek(0)
         while True:
@@ -121,7 +123,7 @@ def _extract_uploaded_zip(uploaded_zip) -> Path:
             zip_handle.write(chunk)
         uploaded_zip.seek(0)
 
-    extract_dir = CACHE_DIR / "extracted" / Path(unique_name).stem
+    extract_dir = CACHE_DIR / "extracted" / f"x_{short_token}"
     extract_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as archive:
         archive.extractall(extract_dir)
@@ -133,7 +135,9 @@ def _extract_zip_file(zip_path: Path) -> Path:
     if zip_path.suffix.lower() != ".zip":
         raise ValueError("Provided file is not a .zip archive.")
 
-    extract_dir = CACHE_DIR / "extracted" / zip_path.stem
+    # Use a short deterministic-ish cache key instead of full stem to keep paths short.
+    short_token = uuid4().hex[:10]
+    extract_dir = CACHE_DIR / "extracted" / f"x_{short_token}"
     extract_dir.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path, "r") as archive:
         archive.extractall(extract_dir)
