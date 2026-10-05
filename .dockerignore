@@ -1,0 +1,17 @@
+.git
+.gitignore
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.streamlit_cache/
+streamlit_outputs/
+scores_from_publication/
+*.ipynb
+*.pt
+*.pth
+*.onnx
