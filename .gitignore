@@ -1,5 +1,6 @@
 # Python
 __pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -25,7 +26,7 @@ filtered_images_3.zip
 runs/
 
 # Notebooks (osobne repo)
-weryfikacje/
+/weryfikacje/
 
 # Package uploads
 utils/uploaded/

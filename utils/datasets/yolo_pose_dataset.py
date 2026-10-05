@@ -945,6 +945,7 @@ class YOLOPoseDataset:
         sample_count: int,
         max_keypoints_to_shift: int,
         max_endpoint_shift: float,
+        min_shift: float = 0.0,
         output_dataset_path: str = None,
         seed: int = None,
     ) -> list:
@@ -959,6 +960,9 @@ class YOLOPoseDataset:
                 to shift in one replaced annotation.
             max_endpoint_shift: Maximum shift magnitude for the first and last
                 keypoint in the sequence.
+            min_shift: Minimum shift magnitude to apply. If this value is larger
+                than what a selected keypoint block allows, the available maximum
+                value is used.
             output_dataset_path: Optional path where a copied dataset with
                 modified labels should be written.
             seed: Optional RNG seed for reproducibility.
@@ -973,6 +977,7 @@ class YOLOPoseDataset:
             sample_count=sample_count,
             max_keypoints_to_shift=max_keypoints_to_shift,
             max_endpoint_shift=max_endpoint_shift,
+            min_shift=min_shift,
             output_dataset_path=output_dataset_path,
             seed=seed,
         )

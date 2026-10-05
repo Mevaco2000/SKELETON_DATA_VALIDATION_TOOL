@@ -6,18 +6,13 @@ from typing import Any, Dict, Tuple
 
 _LAZY_IMPORTS: Dict[str, Tuple[str, str]] = {
     
-    "parse_results_txt": (".weryfikacje.yp_validation_test", "parse_results_txt"),
-    "parse_results_txt_line": (".weryfikacje.yp_validation_test", "parse_results_txt_line"),
-    "parse_distance_anomaly_report": (".weryfikacje.yp_validation_test", "parse_distance_anomaly_report"),
-    "compare_results_txt": (".weryfikacje.yp_validation_test", "compare_results_txt"),
-    "compare_results_txt_entries": (".weryfikacje.yp_validation_test", "compare_results_txt_entries"),
-    "compare_results_txt_to_distance_anomalies": (".weryfikacje.yp_validation_test", "compare_results_txt_to_distance_anomalies"),
-    "compare_results_txt_to_distance_anomalies_with_outside_keypoints": (".weryfikacje.yp_validation_test", "compare_results_txt_to_distance_anomalies_with_outside_keypoints"),
-    "copy_missing_person_labels_from_results": (".weryfikacje.yp_validation_test", "copy_missing_person_labels_from_results"),
-    "save_distance_anomaly_report": (".weryfikacje.yp_validation_test", "save_distance_anomaly_report"),
-    "summarize_results_txt": (".weryfikacje.yp_validation_test", "summarize_results_txt"),
-    "summarize_results_txt_entries": (".weryfikacje.yp_validation_test", "summarize_results_txt_entries"),
-    "YPValidation_Test": (".weryfikacje.yp_validation_test", "YPValidation_Test"),
+    "parse_results_txt": (".merged_ranking_evaluator", "parse_results_txt"),
+    "parse_distance_anomaly_report": (".merged_ranking_evaluator", "parse_distance_anomaly_report"),
+    "compare_results_txt_to_distance_anomalies": (".merged_ranking_evaluator", "compare_results_txt_to_distance_anomalies"),
+    "compare_results_txt_to_distance_anomalies_with_outside_keypoints": (".merged_ranking_evaluator", "compare_results_txt_to_distance_anomalies_with_outside_keypoints"),
+    "save_distance_anomaly_report": (".merged_ranking_evaluator", "save_distance_anomaly_report"),
+    "YPValidation_Test": (".merged_ranking_evaluator", "YPValidation_Test"),
+    "MergedRankingEvaluator": (".merged_ranking_evaluator", "MergedRankingEvaluator"),
     "YOLOPoseImage": ("..datasets.yolo_pose_dataset", "YOLOPoseImage"),
     "YOLOPoseDataset": ("..datasets.yolo_pose_dataset", "YOLOPoseDataset"),
     "YPImageValidation": (".image_validation", "YPImageValidation"),
@@ -43,16 +38,10 @@ def __dir__() -> list[str]:
 __all__ = [
     # analysis (removed)
     "parse_results_txt",
-    "parse_results_txt_line",
     "parse_distance_anomaly_report",
-    "compare_results_txt",
-    "compare_results_txt_entries",
     "compare_results_txt_to_distance_anomalies",
     "compare_results_txt_to_distance_anomalies_with_outside_keypoints",
-    "copy_missing_person_labels_from_results",
     "save_distance_anomaly_report",
-    "summarize_results_txt",
-    "summarize_results_txt_entries",
     # dataset classes
     "YOLOPoseImage",
     "YOLOPoseDataset",
@@ -60,4 +49,5 @@ __all__ = [
     "YPImageValidation",
     "YPSetValidation",
     "YPValidation_Test",
+    "MergedRankingEvaluator",
 ]

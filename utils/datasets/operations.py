@@ -221,36 +221,11 @@ def _compute_segment_angles(keypoints: np.ndarray) -> np.ndarray:
     )
 
 
-def _select_shift_direction(coords: np.ndarray, keypoint_index: int) -> np.ndarray:
-    """Return a unit vector that keeps the original segment orientation unchanged."""
-    if keypoint_index < len(coords) - 1:
-        direction = coords[keypoint_index + 1] - coords[keypoint_index]
-    else:
-        direction = coords[keypoint_index] - coords[keypoint_index - 1]
-
-    norm = float(np.linalg.norm(direction))
-    if norm == 0.0:
-        return np.zeros(2, dtype=float)
-
-    return direction / norm
-
-
-def _max_shift_for_keypoint(
-    coords: np.ndarray,
-    keypoint_index: int,
-    max_endpoint_shift: float,
-) -> float:
-    """Return the largest allowed shift magnitude for a keypoint."""
-    if keypoint_index == 0 or keypoint_index == len(coords) - 1:
-        return float(max_endpoint_shift)
-
-    return float(np.linalg.norm(coords[keypoint_index + 1] - coords[keypoint_index]))
-
-
 def _apply_angle_preserving_shift(
     keypoints: np.ndarray,
     keypoint_count_to_shift: int,
     max_endpoint_shift: float,
+    min_shift: float,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, List[int], np.ndarray]:
     """Shift one contiguous block of keypoints while preserving block geometry."""
@@ -312,8 +287,8 @@ def _apply_angle_preserving_shift(
         return replaced, [], shift_vectors
 
     unit_direction = direction / direction_norm
-    min_shift = 0.0
-    shift_distance = float(rng.uniform(min_shift, max_shift))
+    min_shift_for_option = min(float(min_shift), float(max_shift))
+    shift_distance = float(rng.uniform(min_shift_for_option, max_shift))
     if rng.random() < 0.5:
         shift_distance *= -1.0
 
@@ -1220,6 +1195,7 @@ def replace_angle_preserving_keypoints(
     sample_count: int,
     max_keypoints_to_shift: int,
     max_endpoint_shift: float,
+    min_shift: float = 0.0,
     labels_dir: Optional[str] = None,
     output_dataset_path: Optional[str] = None,
     seed: Optional[int] = None,
@@ -1240,6 +1216,9 @@ def replace_angle_preserving_keypoints(
         max_keypoints_to_shift: Exact number of keypoints to move in a single
             replaced annotation, capped by the number of available keypoints.
         max_endpoint_shift: Maximum shift magnitude for edge keypoints.
+        min_shift: Minimum shift magnitude to apply. If this value is larger than
+            the available maximum for a selected block, the method uses that
+            available maximum.
         labels_dir: Optional explicit labels directory.
         output_dataset_path: Optional path where a copied dataset with modified
             labels should be written. When omitted, labels are modified in place.
@@ -1260,6 +1239,8 @@ def replace_angle_preserving_keypoints(
         raise ValueError("max_keypoints_to_shift must be > 0")
     if max_endpoint_shift < 0:
         raise ValueError("max_endpoint_shift must be >= 0")
+    if min_shift < 0:
+        raise ValueError("min_shift must be >= 0")
 
     if isinstance(dataset, YOLOPoseDataset):
         yolo_dataset = dataset
@@ -1295,6 +1276,7 @@ def replace_angle_preserving_keypoints(
             original_keypoints,
             keypoint_count_to_shift=exact_shift_count,
             max_endpoint_shift=max_endpoint_shift,
+            min_shift=min_shift,
             rng=rng,
         )
 
@@ -1735,7 +1717,8 @@ def split_yolo_pose_dataset(
     output_root: str,
     val_ratio: float = DEFAULT_VAL_RATIO,
     seed: int = DEFAULT_RANDOM_SEED,
-    dataset_path: Optional[str] = None
+    dataset_path: Optional[str] = None,
+    copy_mode: bool = False,
 ) -> None:
     """Split YOLO pose dataset into train and validation sets.
     
@@ -1745,6 +1728,7 @@ def split_yolo_pose_dataset(
         val_ratio: Fraction of data to use for validation
         seed: Random seed for reproducibility
         dataset_path: Base path for data.yaml (defaults to output_root)
+        copy_mode: If True, keep full train set and copy val subset from it
     """
     random.seed(seed)
 
@@ -1774,8 +1758,14 @@ def split_yolo_pose_dataset(
     random.shuffle(image_files)
 
     split_index = int(len(image_files) * (1 - val_ratio))
-    train_files = image_files[:split_index]
-    val_files = image_files[split_index:]
+
+    if copy_mode:
+        val_count = len(image_files) - split_index
+        train_files = image_files
+        val_files = image_files[:val_count]
+    else:
+        train_files = image_files[:split_index]
+        val_files = image_files[split_index:]
 
     def copy_files(file_list, img_out_dir: str, lbl_out_dir: str):
         txt_lines = []

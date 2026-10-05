@@ -21,6 +21,20 @@ from .operations import (
     save_results_console_output,
     extract_image_subset,
 )
+from .dataset_formats import (
+    KeypointAnnotation,
+    KeypointSample,
+    KeypointDatasetFormat,
+    KeypointFormatRegistry,
+    YoloPoseFormat,
+    CocoKeypointsFormat,
+    FORMAT_REGISTRY,
+)
+from .format_converters import (
+    convert_registered_format_to_yolo_pose,
+    convert_coco_keypoints_with_ultralytics,
+)
+from .keypoint_dataset_adapter import KeypointDatasetAdapter
 
 __all__ = [
     # Dataset classes
@@ -45,4 +59,16 @@ __all__ = [
     "flatten_split_yolo_pose",
     "save_results_console_output",
     "extract_image_subset",
+    # format definitions
+    "KeypointAnnotation",
+    "KeypointSample",
+    "KeypointDatasetFormat",
+    "KeypointFormatRegistry",
+    "YoloPoseFormat",
+    "CocoKeypointsFormat",
+    "FORMAT_REGISTRY",
+    # converters
+    "convert_registered_format_to_yolo_pose",
+    "convert_coco_keypoints_with_ultralytics",
+    "KeypointDatasetAdapter",
 ]

@@ -1,7 +1,9 @@
-# (Cofnięcie zmian: przywrócenie poprzedniej wersji pliku)
-"""Dataset-level validation methods: LBP features and duplicate detection."""
+﻿"""Dataset-level validation methods: LBP features and duplicate detection."""
 
 import os
+import math
+import shutil
+import tempfile
 from typing import List, Tuple, Optional, Union, Callable, Dict, Any, Sequence
 import numpy as np
 import cv2
@@ -145,91 +147,507 @@ def _load_clip_model(device: str) -> Tuple:
     return model, preprocess
 
 
-def _compute_embeddings(
-    image_folder: str,
-    model,
-    preprocess,
-    device: str
-) -> Tuple[np.ndarray, List[str]]:
-    """Compute CLIP embeddings for all images in folder.
-    
-    Args:
-        image_folder: Path to folder with images
-        model: CLIP model instance
-        preprocess: CLIP preprocessing function
-        device: Device for inference
-        
-    Returns:
-        Tuple of (embeddings array, list of filenames)
-    """
-    image_files = [
-        f for f in os.listdir(image_folder)
-        if f.lower().endswith(VALID_IMAGE_EXTENSIONS)
-    ]
-
-    embeddings = []
-    filenames = []
-
-    with torch.no_grad():
-        for filename in tqdm(image_files, desc="Computing embeddings"):
-            path = os.path.join(image_folder, filename)
-
-            try:
-                image = Image.open(path).convert("RGB")
-                image = preprocess(image).unsqueeze(0).to(device)
-
-                embedding = model.encode_image(image)
-                embedding = embedding / embedding.norm(dim=-1, keepdim=True)
-
-                embeddings.append(embedding.cpu().numpy())
-                filenames.append(filename)
-            except Exception:
-                continue
-
-    embeddings = np.vstack(embeddings).astype("float32")
-    return embeddings, filenames
-
-
  
 
 
 class YPSetValidation:
-    """
-    Validation for entire dataset - computes features across all images.
-    
-    Wraps YOLOPoseDataset and YPImageValidation to compute LBP features
-    and validate sequential distances across the entire dataset.
-    
-    Use this class for dataset-level operations like batch feature extraction
-    and distance anomaly detection.
-    Use YPImageValidation for single image operations.
-    
-    USAGE PATTERNS:
-    
-    Example 1 - Get all LBP decimals:
-        >>> from github.utils.validation import YPSetValidation, YOLOPoseDataset
-        >>> dataset = YOLOPoseDataset('train.txt')
-        >>> validator = YPSetValidation(dataset)
-        >>> decimals, counts_per_image, paths = validator.get_all_lbp_decimals(patch_size=5)
-    
-    Example 2 - Check where sequential distances are anomalous:
-        >>> validator = YPSetValidation(dataset)
-        >>> models = validator.train_distance_models(model_factory="linear")
-        >>> anomalies = validator.predict_distance_anomalies(models, threshold_percentile=95)
-        >>> # Returns list of images ranked by distance prediction error
-    
-    Example 3 - Get dataset statistics:
-        >>> stats = validator.get_stats()
-    """
     
     def __init__(self, dataset):
-        """
-        Initialize dataset validator.
-        
-        Args:
-            dataset: YOLOPoseDataset instance
-        """
         self.dataset = dataset
+
+    @staticmethod
+    def _load_yolo_pose_model(model):
+        """Return an Ultralytics YOLO model from an existing object or weights path."""
+        if hasattr(model, "train") and hasattr(model, "predict"):
+            resolved_model = model
+            overrides = getattr(resolved_model, "overrides", None)
+            if isinstance(overrides, dict) and "model" not in overrides:
+                fallback_model = getattr(resolved_model, "ckpt_path", None) or getattr(resolved_model, "model_name", None)
+                if fallback_model:
+                    overrides["model"] = fallback_model
+            return resolved_model
+
+        from ultralytics import YOLO
+
+        resolved_model = YOLO(model)
+        overrides = getattr(resolved_model, "overrides", None)
+        if isinstance(overrides, dict) and "model" not in overrides:
+            overrides["model"] = str(model)
+        return resolved_model
+
+    @staticmethod
+    def _ensure_ultralytics_model_override(model_obj, model_hint: Optional[Any] = None) -> None:
+        """Populate model overrides['model'] when Ultralytics drops it between train calls."""
+        overrides = getattr(model_obj, "overrides", None)
+        if not isinstance(overrides, dict):
+            return
+        if "model" in overrides and overrides.get("model"):
+            return
+
+        fallback = (
+            getattr(model_obj, "ckpt_path", None)
+            or getattr(model_obj, "model_name", None)
+            or model_hint
+        )
+        if fallback:
+            overrides["model"] = str(fallback)
+
+    @staticmethod
+    def _get_result_keypoints_xy_normalized(result, image_shape: Tuple[int, ...]) -> List[np.ndarray]:
+        """Extract predicted keypoint coordinates from an Ultralytics result in normalized image coordinates."""
+        if getattr(result, "keypoints", None) is None:
+            return []
+
+        keypoints = result.keypoints
+        if getattr(keypoints, "xyn", None) is not None:
+            predicted = keypoints.xyn.detach().cpu().numpy()
+        elif getattr(keypoints, "xy", None) is not None:
+            predicted = keypoints.xy.detach().cpu().numpy()
+            height, width = image_shape[:2]
+            scale = np.asarray([max(float(width), 1.0), max(float(height), 1.0)], dtype=float)
+            predicted = predicted / scale
+        else:
+            return []
+
+        if predicted.ndim == 2:
+            predicted = predicted[np.newaxis, :, :]
+        return [np.asarray(person[:, :2], dtype=float) for person in predicted if np.asarray(person).size > 0]
+
+    @staticmethod
+    def _keypoint_prediction_error(
+        actual_keypoints: np.ndarray,
+        predicted_keypoints: Optional[np.ndarray],
+        visibility_threshold: Optional[float] = 0.0,
+    ) -> Tuple[float, np.ndarray, int]:
+        """Compute summed Euclidean keypoint error for one actual/predicted person pair."""
+        actual = np.asarray(actual_keypoints, dtype=float)
+        if actual.size == 0:
+            return math.inf, np.array([], dtype=float), 0
+
+        if actual.ndim != 2 or actual.shape[1] < 2:
+            return math.inf, np.array([], dtype=float), 0
+
+        visible_mask = np.ones(actual.shape[0], dtype=bool)
+        if visibility_threshold is not None and actual.shape[1] >= 3:
+            visible_mask = actual[:, 2] >= float(visibility_threshold)
+
+        if predicted_keypoints is None:
+            per_keypoint_errors = np.full(actual.shape[0], np.nan, dtype=float)
+            per_keypoint_errors[visible_mask] = 1.0
+            return float(np.nansum(per_keypoint_errors)), per_keypoint_errors, int(np.sum(visible_mask))
+
+        predicted = np.asarray(predicted_keypoints, dtype=float)
+        compared_count = min(actual.shape[0], predicted.shape[0])
+        per_keypoint_errors = np.full(actual.shape[0], np.nan, dtype=float)
+
+        if compared_count > 0:
+            compared_mask = visible_mask[:compared_count]
+            errors = np.linalg.norm(
+                actual[:compared_count, :2] - predicted[:compared_count, :2],
+                axis=1,
+            )
+            per_keypoint_errors[:compared_count] = np.where(compared_mask, errors, np.nan)
+
+        if actual.shape[0] > compared_count:
+            per_keypoint_errors[compared_count:][visible_mask[compared_count:]] = 1.0
+
+        finite_errors = per_keypoint_errors[np.isfinite(per_keypoint_errors)]
+        return float(np.sum(finite_errors)) if finite_errors.size else math.inf, per_keypoint_errors, int(finite_errors.size)
+
+    @staticmethod
+    def _match_predictions_to_actual_persons(
+        actual_person_keypoints: Sequence[np.ndarray],
+        predicted_person_keypoints: Sequence[np.ndarray],
+        visibility_threshold: Optional[float] = 0.0,
+    ) -> List[Tuple[Optional[int], float, np.ndarray, int]]:
+        """Greedily match predicted persons to actual persons by lowest keypoint error."""
+        unmatched_predictions = set(range(len(predicted_person_keypoints)))
+        matches: List[Tuple[Optional[int], float, np.ndarray, int]] = []
+
+        for actual_keypoints in actual_person_keypoints:
+            best_prediction_idx = None
+            best_error = math.inf
+            best_per_keypoint_errors = np.array([], dtype=float)
+            best_valid_count = 0
+
+            for prediction_idx in list(unmatched_predictions):
+                error, per_keypoint_errors, valid_count = YPSetValidation._keypoint_prediction_error(
+                    actual_keypoints,
+                    predicted_person_keypoints[prediction_idx],
+                    visibility_threshold=visibility_threshold,
+                )
+                if error < best_error:
+                    best_prediction_idx = prediction_idx
+                    best_error = error
+                    best_per_keypoint_errors = per_keypoint_errors
+                    best_valid_count = valid_count
+
+            if best_prediction_idx is not None:
+                unmatched_predictions.remove(best_prediction_idx)
+                matches.append((best_prediction_idx, best_error, best_per_keypoint_errors, best_valid_count))
+            else:
+                error, per_keypoint_errors, valid_count = YPSetValidation._keypoint_prediction_error(
+                    actual_keypoints,
+                    None,
+                    visibility_threshold=visibility_threshold,
+                )
+                matches.append((None, error, per_keypoint_errors, valid_count))
+
+        return matches
+
+    @staticmethod
+    def _write_split_file_from_indices(dataset, indices: Sequence[int], output_path: str) -> str:
+        with open(output_path, "w", encoding="utf-8") as file_handle:
+            for index in indices:
+                image_path = dataset._valid_pairs[int(index)][0]
+                # Use absolute paths to avoid CWD-dependent failures in Ultralytics data loading.
+                file_handle.write(os.path.abspath(image_path) + "\n")
+        return output_path
+
+    @staticmethod
+    def _ensure_ultralytics_label_layout(dataset, image_paths: Optional[Sequence[str]] = None) -> None:
+        """Create labels/train compatibility links when labels are stored flat in labels/."""
+        dataset_dir = os.path.abspath(getattr(dataset, "dataset_dir", os.path.dirname(getattr(dataset, "dataset_file", ""))))
+        images_train_dir = os.path.join(dataset_dir, "images", "train")
+        labels_root_dir = os.path.join(dataset_dir, "labels")
+        labels_train_dir = os.path.join(labels_root_dir, "train")
+
+        if not os.path.isdir(images_train_dir) or not os.path.isdir(labels_root_dir):
+            return
+
+        if os.path.isdir(labels_train_dir):
+            try:
+                if any(os.scandir(labels_train_dir)):
+                    return
+            except OSError:
+                return
+        else:
+            os.makedirs(labels_train_dir, exist_ok=True)
+
+        resolved_image_paths = image_paths
+        if resolved_image_paths is None:
+            resolved_image_paths = [pair[0] for pair in getattr(dataset, "_valid_pairs", [])]
+
+        for image_path in resolved_image_paths:
+            label_name = os.path.splitext(os.path.basename(str(image_path)))[0] + ".txt"
+            source_label = os.path.join(labels_root_dir, label_name)
+            target_label = os.path.join(labels_train_dir, label_name)
+            if not os.path.isfile(source_label) or os.path.exists(target_label):
+                continue
+            try:
+                os.link(source_label, target_label)
+            except OSError:
+                shutil.copy2(source_label, target_label)
+
+    @staticmethod
+    def _find_dataset_yaml(dataset) -> Optional[str]:
+        candidate_dirs = [
+            os.path.dirname(os.path.abspath(getattr(dataset, "dataset_file", ""))),
+            os.path.abspath(getattr(dataset, "dataset_dir", "")),
+        ]
+        for candidate_dir in candidate_dirs:
+            if not candidate_dir:
+                continue
+            for filename in ("data.yaml", "dataset.yaml", "data.yml", "dataset.yml"):
+                candidate_path = os.path.join(candidate_dir, filename)
+                if os.path.exists(candidate_path):
+                    return candidate_path
+        return None
+
+    @staticmethod
+    def _build_yolo_training_yaml(dataset, train_file: str, output_yaml: str, base_data_yaml: Optional[str] = None) -> str:
+        try:
+            import yaml
+        except ImportError:
+            raise ImportError("PyYAML is required to build temporary YOLO data YAML files. Install: pip install pyyaml")
+
+        data_config: Dict[str, Any] = {}
+        resolved_base_yaml = base_data_yaml or YPSetValidation._find_dataset_yaml(dataset)
+        if resolved_base_yaml is not None and os.path.exists(resolved_base_yaml):
+            with open(resolved_base_yaml, "r", encoding="utf-8") as file_handle:
+                loaded_config = yaml.safe_load(file_handle) or {}
+            if isinstance(loaded_config, dict):
+                data_config.update(loaded_config)
+
+        data_config.setdefault("path", os.path.abspath(getattr(dataset, "dataset_dir", os.path.dirname(train_file))))
+        data_config["train"] = os.path.abspath(train_file)
+        data_config.setdefault("val", os.path.abspath(train_file))
+
+        with open(output_yaml, "w", encoding="utf-8") as file_handle:
+            yaml.safe_dump(data_config, file_handle, sort_keys=False, allow_unicode=True)
+        return output_yaml
+
+    def _rank_model_keypoint_errors(
+        self,
+        model,
+        visibility_threshold: Optional[float] = 0.0,
+        predict_kwargs: Optional[Dict[str, Any]] = None,
+        stage: str = "model_prediction",
+        verbose: bool = True,
+    ) -> Dict[str, Any]:
+        """Predict the dataset and rank person annotations by summed keypoint error."""
+        resolved_predict_kwargs = dict(predict_kwargs or {})
+        records: List[Dict[str, Any]] = []
+        total = len(self.dataset)
+        iterator = self.dataset
+        if verbose:
+            iterator = tqdm(iterator, total=total, desc=f"Predicting keypoints ({stage})")
+
+        for sample_index, sample in enumerate(iterator):
+            image_path = sample.get('image_path')
+            image = sample.get('image')
+            actual_person_keypoints = self._get_sample_person_keypoints(sample)
+
+            try:
+                prediction_args = {
+                    "source": image_path,
+                    "verbose": False,
+                }
+                prediction_args.update(resolved_predict_kwargs)
+                result = model.predict(**prediction_args)[0]
+                predicted_person_keypoints = self._get_result_keypoints_xy_normalized(result, image.shape)
+            except Exception as exc:
+                if verbose:
+                    print(f"Prediction failed for {image_path}: {exc}")
+                predicted_person_keypoints = []
+
+            matched_predictions = self._match_predictions_to_actual_persons(
+                actual_person_keypoints,
+                predicted_person_keypoints,
+                visibility_threshold=visibility_threshold,
+            )
+
+            for person_index, (prediction_index, error, per_keypoint_errors, valid_count) in enumerate(matched_predictions):
+                records.append({
+                    "image_path": image_path,
+                    "person_id": int(person_index),
+                    "person_index": int(person_index),
+                    "sample_index": int(sample_index),
+                    "prediction_index": None if prediction_index is None else int(prediction_index),
+                    "error": float(error),
+                    "sort_score": float(error),
+                    "keypoint_error_sum": float(error),
+                    "per_keypoint_errors": per_keypoint_errors,
+                    "valid_keypoint_count": int(valid_count),
+                    "stage": stage,
+                })
+
+        records.sort(key=lambda record: record["sort_score"], reverse=True)
+        for rank, record in enumerate(records, start=1):
+            record["rank"] = int(rank)
+
+        return {
+            "images": records,
+            "records": records,
+            "combined_ranking": records,
+            "sort_by": "keypoint_error_sum_desc",
+            "stage": stage,
+            "statistics": {
+                "total_images": int(total),
+                "total_records": int(len(records)),
+                "finite_error_records": int(sum(np.isfinite(record["error"]) for record in records)),
+            },
+        }
+
+    def model_in_the_loop_validation(
+        self,
+        model,
+        initial_epochs: int,
+        remove_percent: float,
+        fine_tune_epochs: int,
+        data_yaml: Optional[str] = None,
+        work_dir: Optional[str] = None,
+        train_kwargs: Optional[Dict[str, Any]] = None,
+        fine_tune_train_kwargs: Optional[Dict[str, Any]] = None,
+        predict_kwargs: Optional[Dict[str, Any]] = None,
+        visibility_threshold: Optional[float] = 0.0,
+        lightweight_return: bool = False,
+        lightweight_top_k: Optional[int] = None,
+        verbose: bool = True,
+    ) -> Dict[str, Any]:
+        """Run model-in-the-loop validation for YOLO pose training.
+
+        Workflow:
+        1. Train an Ultralytics YOLO pose model for ``initial_epochs``.
+        2. Predict the full training set and rank annotations by summed keypoint error.
+        3. Remove ``remove_percent`` percent of the highest-error images from the training split.
+        4. Continue training the same model object for ``fine_tune_epochs`` on the reduced split.
+        5. Predict the original full set again and return a final ranking compatible with
+           ``MergedRankingEvaluator``-style consumers.
+
+        Args:
+            model: Existing Ultralytics YOLO model object or path to weights.
+            initial_epochs: Number of epochs for the first training stage.
+            remove_percent: Percent of training images to exclude before the second stage.
+            fine_tune_epochs: Number of epochs for continued training on the reduced split.
+            data_yaml: Optional source dataset YAML. When omitted, ``data.yaml`` is searched
+                near the dataset split and copied with an overridden train split.
+            work_dir: Directory for temporary split/YAML files. Defaults to a temp directory.
+            train_kwargs: Extra keyword arguments passed to the first ``model.train`` call.
+            fine_tune_train_kwargs: Extra keyword arguments for the second ``model.train`` call.
+                Values override ``train_kwargs``.
+            predict_kwargs: Extra keyword arguments passed to ``model.predict``.
+            visibility_threshold: Minimum ground-truth visibility used when summing errors.
+            lightweight_return: When ``True``, return a compact payload without heavyweight
+                objects such as full rankings and model instance.
+            lightweight_top_k: Optional maximum number of ranked records kept in compact
+                output. Ignored when ``lightweight_return`` is ``False``.
+            verbose: Print progress information.
+
+        Returns:
+            Dictionary with ``combined_ranking`` and ``images`` containing the final sorted
+            ranking. It also includes ``initial_ranking``, ``removed_records``,
+            ``kept_train_file``, ``ranking_meta`` and ``statistics``.
+        """
+        if initial_epochs < 0 or fine_tune_epochs < 0:
+            raise ValueError("Epoch counts must be non-negative")
+        if remove_percent < 0 or remove_percent >= 100:
+            raise ValueError("remove_percent must be in the range [0, 100)")
+        if len(self.dataset) == 0:
+            raise ValueError("Dataset is empty")
+
+        self._ensure_ultralytics_label_layout(self.dataset)
+
+        resolved_model = self._load_yolo_pose_model(model)
+        self._ensure_ultralytics_model_override(resolved_model, model_hint=model)
+        base_train_kwargs = dict(train_kwargs or {})
+        # MITL is usually run repeatedly in notebooks; disable validation/artifacts by default
+        # to reduce RAM and disk pressure unless caller explicitly overrides these flags.
+        base_train_kwargs.setdefault("val", False)
+        base_train_kwargs.setdefault("plots", False)
+        base_train_kwargs.setdefault("save", False)
+        second_train_kwargs = dict(base_train_kwargs)
+        second_train_kwargs.update(fine_tune_train_kwargs or {})
+
+        resolved_work_dir = tempfile.mkdtemp(prefix="model_in_loop_") if work_dir is None else os.path.abspath(work_dir)
+        os.makedirs(resolved_work_dir, exist_ok=True)
+
+        full_train_file = os.path.join(resolved_work_dir, "train_full.txt")
+        full_data_yaml = os.path.join(resolved_work_dir, "data_full.yaml")
+        all_indices = list(range(len(self.dataset)))
+        self._write_split_file_from_indices(self.dataset, all_indices, full_train_file)
+        self._build_yolo_training_yaml(self.dataset, full_train_file, full_data_yaml, base_data_yaml=data_yaml)
+
+        if verbose:
+            print(f"Initial training: {initial_epochs} epochs on {len(all_indices)} images")
+        if initial_epochs > 0:
+            self._ensure_ultralytics_model_override(resolved_model, model_hint=model)
+            resolved_model.train(data=full_data_yaml, epochs=int(initial_epochs), **base_train_kwargs)
+
+        initial_ranking = self._rank_model_keypoint_errors(
+            resolved_model,
+            visibility_threshold=visibility_threshold,
+            predict_kwargs=predict_kwargs,
+            stage="after_initial_training",
+            verbose=verbose,
+        )
+
+        remove_image_count = int(math.ceil(len(self.dataset) * (float(remove_percent) / 100.0)))
+        removed_image_paths = []
+        removed_image_path_set = set()
+        removed_records = []
+        for record in initial_ranking["images"]:
+            if len(removed_image_paths) >= remove_image_count:
+                break
+            normalized_path = os.path.normcase(os.path.abspath(record["image_path"]))
+            if normalized_path in removed_image_path_set:
+                continue
+            removed_image_path_set.add(normalized_path)
+            removed_image_paths.append(record["image_path"])
+            removed_records.append(record)
+
+        kept_indices = [
+            index for index, (image_path, _) in enumerate(self.dataset._valid_pairs)
+            if os.path.normcase(os.path.abspath(image_path)) not in removed_image_path_set
+        ]
+        if not kept_indices:
+            raise ValueError("remove_percent removed all training images; choose a smaller value")
+
+        kept_train_file = os.path.join(resolved_work_dir, "train_reduced.txt")
+        kept_data_yaml = os.path.join(resolved_work_dir, "data_reduced.yaml")
+        self._write_split_file_from_indices(self.dataset, kept_indices, kept_train_file)
+        self._build_yolo_training_yaml(self.dataset, kept_train_file, kept_data_yaml, base_data_yaml=data_yaml)
+
+        if verbose:
+            print(
+                f"Continuing training: {fine_tune_epochs} epochs on {len(kept_indices)} images "
+                f"({len(removed_image_paths)} removed)"
+            )
+        if fine_tune_epochs > 0:
+            self._ensure_ultralytics_model_override(resolved_model, model_hint=model)
+            resolved_model.train(data=kept_data_yaml, epochs=int(fine_tune_epochs), **second_train_kwargs)
+
+        final_ranking = self._rank_model_keypoint_errors(
+            resolved_model,
+            visibility_threshold=visibility_threshold,
+            predict_kwargs=predict_kwargs,
+            stage="after_reduced_training",
+            verbose=verbose,
+        )
+
+        ranking_meta = {
+            "initial_epochs": int(initial_epochs),
+            "fine_tune_epochs": int(fine_tune_epochs),
+            "remove_percent": float(remove_percent),
+            "initial_train_image_count": int(len(all_indices)),
+            "reduced_train_image_count": int(len(kept_indices)),
+            "removed_image_count": int(len(removed_image_paths)),
+            "removed_record_count": int(len(removed_records)),
+        }
+
+        if lightweight_return:
+            compact_records = []
+            for record in final_ranking["records"]:
+                compact_records.append({
+                    "rank": int(record.get("rank", 0)),
+                    "image_path": record.get("image_path"),
+                    "person_id": int(record.get("person_id", 0)),
+                    "error": float(record.get("error", math.inf)),
+                })
+            if isinstance(lightweight_top_k, int) and lightweight_top_k > 0:
+                compact_records = compact_records[:lightweight_top_k]
+
+            return {
+                "weights": (1.0,),
+                "output_path": None,
+                "ranking_meta": ranking_meta,
+                "combined_ranking": compact_records,
+                "statistics": {
+                    **ranking_meta,
+                    "final_total_records": int(len(final_ranking["records"])),
+                    "returned_records": int(len(compact_records)),
+                    "work_dir": resolved_work_dir,
+                    "lightweight_return": True,
+                },
+                "kept_train_file": kept_train_file,
+                "kept_data_yaml": kept_data_yaml,
+                "full_train_file": full_train_file,
+                "full_data_yaml": full_data_yaml,
+                "removed_image_paths": removed_image_paths,
+            }
+
+        return {
+            "weights": (1.0,),
+            "output_path": None,
+            "ranking_meta": ranking_meta,
+            "combined_ranking": final_ranking["combined_ranking"],
+            "images": final_ranking["images"],
+            "records": final_ranking["records"],
+            "initial_ranking": initial_ranking,
+            "final_ranking": final_ranking,
+            "removed_records": removed_records,
+            "removed_image_paths": removed_image_paths,
+            "kept_train_file": kept_train_file,
+            "kept_data_yaml": kept_data_yaml,
+            "full_train_file": full_train_file,
+            "full_data_yaml": full_data_yaml,
+            "statistics": {
+                **ranking_meta,
+                "final_total_records": int(len(final_ranking["records"])),
+                "work_dir": resolved_work_dir,
+            },
+            "model": resolved_model,
+        }
 
     @staticmethod
     def _get_sample_person_keypoints(sample) -> List[np.ndarray]:
@@ -244,263 +662,6 @@ class YPSetValidation:
         if keypoints is None or np.asarray(keypoints).size == 0:
             return []
         return [np.asarray(keypoints)]
-
-    @staticmethod
-    def _get_visible_keypoint_coords(
-        keypoints: np.ndarray,
-        image_shape: Tuple[int, ...],
-        visibility_threshold: Optional[float] = None,
-    ) -> np.ndarray:
-        """Return visible keypoints as pixel coordinates for localization."""
-        keypoints_array = np.asarray(keypoints, dtype=float)
-        if keypoints_array.size == 0:
-            return np.zeros((0, 2), dtype=float)
-
-        coords = keypoints_array[:, :2].copy()
-        if visibility_threshold is not None and keypoints_array.shape[1] >= 3:
-            coords = coords[keypoints_array[:, 2] >= visibility_threshold]
-
-        if coords.size == 0:
-            return np.zeros((0, 2), dtype=float)
-
-        height, width = image_shape[:2]
-        if np.nanmax(coords) <= 1.0:
-            coords[:, 0] *= width
-            coords[:, 1] *= height
-
-        return coords
-
-    @staticmethod
-    def _compute_person_localization(
-        keypoints: np.ndarray,
-        image_shape: Tuple[int, ...],
-        visibility_threshold: Optional[float] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Build a padded localization box and center from visible keypoints."""
-        coords = YPSetValidation._get_visible_keypoint_coords(
-            keypoints,
-            image_shape,
-            visibility_threshold=visibility_threshold,
-        )
-        if coords.size == 0:
-            return None
-
-        height, width = image_shape[:2]
-        center = coords.mean(axis=0)
-        x_min = float(np.min(coords[:, 0]))
-        y_min = float(np.min(coords[:, 1]))
-        x_max = float(np.max(coords[:, 0]))
-        y_max = float(np.max(coords[:, 1]))
-
-        span_x = max(x_max - x_min, width * 0.04)
-        span_y = max(y_max - y_min, height * 0.04)
-        pad_x = max(span_x * 0.2, width * 0.02)
-        pad_y = max(span_y * 0.2, height * 0.02)
-        half_w = max(span_x * 0.5 + pad_x, width * 0.02)
-        half_h = max(span_y * 0.5 + pad_y, height * 0.02)
-
-        bbox = (
-            max(0.0, float(center[0]) - half_w),
-            max(0.0, float(center[1]) - half_h),
-            min(float(width - 1), float(center[0]) + half_w),
-            min(float(height - 1), float(center[1]) + half_h),
-        )
-
-        return {
-            "center": (float(center[0]), float(center[1])),
-            "bbox": bbox,
-            "keypoints_xy": coords,
-        }
-
-    @staticmethod
-    def _compute_mask_localization(mask: np.ndarray) -> Optional[Dict[str, Any]]:
-        """Build a bounding box and center for a binary mask."""
-        mask_array = np.asarray(mask)
-        if mask_array.ndim == 3:
-            mask_array = np.any(mask_array > 0, axis=2)
-        else:
-            mask_array = mask_array > 0
-
-        ys, xs = np.nonzero(mask_array)
-        if xs.size == 0:
-            return None
-
-        bbox = (
-            float(np.min(xs)),
-            float(np.min(ys)),
-            float(np.max(xs)),
-            float(np.max(ys)),
-        )
-        center = (float(np.mean(xs)), float(np.mean(ys)))
-
-        return {
-            "center": center,
-            "bbox": bbox,
-            "area": int(xs.size),
-        }
-
-    @staticmethod
-    def _bbox_area(bbox: Tuple[float, float, float, float]) -> float:
-        """Return the area of a bounding box."""
-        return max(float(bbox[2]) - float(bbox[0]), 0.0) * max(float(bbox[3]) - float(bbox[1]), 0.0)
-
-    @staticmethod
-    def _bbox_intersection(
-        bbox_a: Tuple[float, float, float, float],
-        bbox_b: Tuple[float, float, float, float],
-    ) -> Tuple[float, float, float, float]:
-        """Return the intersection of two bounding boxes."""
-        return (
-            max(float(bbox_a[0]), float(bbox_b[0])),
-            max(float(bbox_a[1]), float(bbox_b[1])),
-            min(float(bbox_a[2]), float(bbox_b[2])),
-            min(float(bbox_a[3]), float(bbox_b[3])),
-        )
-    def _match_person_masks_by_localization(
-        self,
-        person_keypoints: Sequence[np.ndarray],
-        masks: Sequence[np.ndarray],
-        image_shape: Tuple[int, ...],
-        visibility_threshold: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """Match persons to masks using spatial localization instead of keypoint counts.
-
-        The pairing cost is derived from person and mask geometry:
-        keypoint-derived person center, padded keypoint bounding box, mask center,
-        and mask bounding box overlap. Lower cost means a better spatial match.
-        """
-        person_keypoints = [np.asarray(keypoints) for keypoints in person_keypoints]
-        person_localizations = [
-            self._compute_person_localization(
-                keypoints,
-                image_shape,
-                visibility_threshold=visibility_threshold,
-            )
-            for keypoints in person_keypoints
-        ]
-        mask_localizations = [self._compute_mask_localization(mask) for mask in masks]
-
-        costs = np.full((len(person_keypoints), len(masks)), np.inf, dtype=float)
-        plausible_matches = np.zeros((len(person_keypoints), len(masks)), dtype=bool)
-        pair_metrics: List[List[Dict[str, Any]]] = [
-            [{} for _ in range(len(masks))]
-            for _ in range(len(person_keypoints))
-        ]
-
-        image_height, image_width = image_shape[:2]
-        image_diagonal = max(float(np.hypot(image_width, image_height)), 1.0)
-
-        for person_idx, person_loc in enumerate(person_localizations):
-            if person_loc is None:
-                continue
-
-            person_box = person_loc["bbox"]
-            person_center = np.asarray(person_loc["center"], dtype=float)
-            visible_coords = person_loc["keypoints_xy"]
-            person_area = max(self._bbox_area(person_box), 1.0)
-
-            for mask_idx, mask_loc in enumerate(mask_localizations):
-                if mask_loc is None:
-                    pair_metrics[person_idx][mask_idx] = {
-                        "localization_cost": np.inf,
-                        "plausible": False,
-                    }
-                    continue
-
-                mask_box = mask_loc["bbox"]
-                mask_center = np.asarray(mask_loc["center"], dtype=float)
-                center_distance_norm = float(np.linalg.norm(person_center - mask_center) / image_diagonal)
-
-                point_dx = np.maximum(
-                    np.maximum(mask_box[0] - visible_coords[:, 0], 0.0),
-                    visible_coords[:, 0] - mask_box[2],
-                )
-                point_dy = np.maximum(
-                    np.maximum(mask_box[1] - visible_coords[:, 1], 0.0),
-                    visible_coords[:, 1] - mask_box[3],
-                )
-                mean_keypoint_distance_norm = float(np.mean(np.hypot(point_dx, point_dy)) / image_diagonal)
-
-                intersection_box = self._bbox_intersection(person_box, mask_box)
-                intersection_area = self._bbox_area(intersection_box)
-                mask_box_area = max(self._bbox_area(mask_box), 1.0)
-                union_area = max(person_area + mask_box_area - intersection_area, 1.0)
-                person_overlap = float(intersection_area / person_area)
-                mask_overlap = float(intersection_area / mask_box_area)
-                bbox_iou = float(intersection_area / union_area)
-
-                center_x = int(np.clip(np.round(person_center[0]), 0, image_width - 1))
-                center_y = int(np.clip(np.round(person_center[1]), 0, image_height - 1))
-                mask_binary = np.asarray(masks[mask_idx])
-                if mask_binary.ndim == 3:
-                    mask_binary = np.any(mask_binary > 0, axis=2)
-                else:
-                    mask_binary = mask_binary > 0
-                center_inside_mask = bool(mask_binary[center_y, center_x])
-
-                plausible = bool(
-                    center_inside_mask
-                    or person_overlap > 0.0
-                    or mask_overlap > 0.0
-                    or center_distance_norm <= 0.2
-                    or mean_keypoint_distance_norm <= 0.03
-                )
-
-                localization_cost = (
-                    0.55 * center_distance_norm
-                    + 0.30 * mean_keypoint_distance_norm
-                    + 0.15 * (1.0 - person_overlap)
-                )
-                if center_inside_mask:
-                    localization_cost *= 0.6
-                elif person_overlap > 0.0:
-                    localization_cost *= 0.8
-
-                costs[person_idx, mask_idx] = localization_cost
-                plausible_matches[person_idx, mask_idx] = plausible
-                pair_metrics[person_idx][mask_idx] = {
-                    "localization_cost": float(localization_cost),
-                    "center_distance_norm": center_distance_norm,
-                    "mean_keypoint_distance_norm": mean_keypoint_distance_norm,
-                    "person_overlap": person_overlap,
-                    "mask_overlap": mask_overlap,
-                    "bbox_iou": bbox_iou,
-                    "center_inside_mask": center_inside_mask,
-                    "plausible": plausible,
-                }
-
-        assignment: Dict[int, int] = {}
-        remaining_persons = set(range(len(person_keypoints)))
-        remaining_masks = set(range(len(masks)))
-
-        while remaining_persons and remaining_masks:
-            best_pair: Optional[Tuple[int, int]] = None
-            best_cost = np.inf
-
-            for person_idx in remaining_persons:
-                for mask_idx in remaining_masks:
-                    if not plausible_matches[person_idx, mask_idx]:
-                        continue
-                    pair_cost = costs[person_idx, mask_idx]
-                    if pair_cost < best_cost:
-                        best_cost = pair_cost
-                        best_pair = (person_idx, mask_idx)
-
-            if best_pair is None:
-                break
-
-            assignment[best_pair[0]] = best_pair[1]
-            remaining_persons.remove(best_pair[0])
-            remaining_masks.remove(best_pair[1])
-
-        return {
-            "assignment": assignment,
-            "cost_matrix": costs,
-            "plausible_matches": plausible_matches,
-            "pair_metrics": pair_metrics,
-            "person_localizations": person_localizations,
-            "mask_localizations": mask_localizations,
-        }
     
     def get_embeddings(self, device: Optional[str] = None, image_folder: Optional[str] = None) -> Tuple[np.ndarray, List[str]]:
         """
@@ -523,44 +684,12 @@ class YPSetValidation:
             >>> # Or load from explicit folder:
             >>> embeddings, filenames = validator.get_embeddings(image_folder="path/to/images")
         """
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        model, preprocess = _load_clip_model(device)
-
-        embeddings = []
-        filenames = []
-
-        with torch.no_grad():
-            for sample in tqdm(self.dataset, total=len(self.dataset), desc="Computing embeddings"):
-                try:
-                    if image_folder is not None:
-                        # Load image from explicit folder path
-                        rel_path = os.path.relpath(sample['image_path'], self.dataset.dataset_dir)
-                        img_path = os.path.join(image_folder, rel_path)
-                        image = cv2.imread(img_path)
-                        if image is None:
-                            continue
-                    else:
-                        # Use pre-loaded image from dataset
-                        image = sample['image']  # Already loaded numpy array from dataset
-                    
-                    # Convert BGR to RGB for CLIP
-                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    # Convert to PIL Image for preprocessing
-                    from PIL import Image as PILImage
-                    pil_image = PILImage.fromarray(image_rgb)
-                    
-                    processed = preprocess(pil_image).unsqueeze(0).to(device)
-                    embedding = model.encode_image(processed)
-                    embedding = embedding / embedding.norm(dim=-1, keepdim=True)
-                    
-                    embeddings.append(embedding.cpu().numpy())
-                    filenames.append(os.path.basename(sample['image_path']))
-                except Exception:
-                    continue
-
-        embeddings = np.vstack(embeddings).astype("float32")
+        embeddings, image_paths = self._get_embeddings_with_image_paths(
+            device=device,
+            image_folder=image_folder,
+            verbose=True,
+        )
+        filenames = [os.path.basename(path) for path in image_paths]
         return embeddings, filenames
 
     def _get_embeddings_with_image_paths(
@@ -676,76 +805,6 @@ class YPSetValidation:
         """
         return self.dataset.stats
     
-    def get_keypoint_statistics(self, verbose: bool = True) -> dict:
-        """Get visibility statistics for each keypoint index.
-        
-        Shows how many times each keypoint (0-8) appears, is visible, or is occluded.
-        
-        Args:
-            verbose: Print formatted statistics table
-            
-        Returns:
-            Dictionary mapping keypoint_index -> {'total': count, 'visible': count, 'occluded': count}
-            
-        Example:
-            >>> validator = YPSetValidation(dataset)
-            >>> stats = validator.get_keypoint_statistics()
-            >>> print(stats[0])  # {'total': 4758, 'visible': 4317, 'occluded': 441}
-        """
-        return self.dataset.get_keypoint_statistics(verbose=verbose)
-    
-    def get_keypoint_distribution(self, verbose: bool = True) -> dict:
-        """Get distribution of visible keypoints per person.
-        
-        Shows how many persons have each count of visible keypoints.
-        
-        Args:
-            verbose: Print formatted distribution table
-            
-        Returns:
-            Dictionary mapping num_visible_keypoints -> count of persons with that many
-            
-        Example:
-            >>> validator = YPSetValidation(dataset)
-            >>> dist = validator.get_keypoint_distribution()
-            >>> print(dist)  # {5: 10, 6: 45, 7: 120, 8: 234, 9: 3349}
-        """
-        return self.dataset.get_keypoint_distribution(verbose=verbose)
-
-    @staticmethod
-    def _mask_to_binary(mask: np.ndarray) -> np.ndarray:
-        """Normalize a mask to a boolean foreground map."""
-        mask_array = np.asarray(mask)
-        if mask_array.ndim == 3:
-            return np.any(mask_array > 0, axis=2)
-        return mask_array > 0
-
-    @staticmethod
-    def _colorize_masks(image_shape: Tuple[int, ...], masks: Sequence[np.ndarray], colors: Sequence[Tuple[int, int, int]]) -> np.ndarray:
-        """Create a color panel showing all masks."""
-        height, width = image_shape[:2]
-        panel = np.zeros((height, width, 3), dtype=np.uint8)
-        for mask_idx, mask in enumerate(masks):
-            panel[YPSetValidation._mask_to_binary(mask)] = colors[mask_idx % len(colors)]
-        return panel
-
-    def _build_visualization_output_path(self, output_folder: str, image_path: str) -> str:
-        """Build an output path that preserves dataset-relative folders when possible."""
-        dataset_root = getattr(self.dataset, 'dataset_dir', None)
-        try:
-            if dataset_root:
-                relative_path = os.path.relpath(image_path, dataset_root)
-            else:
-                relative_path = os.path.basename(image_path)
-        except ValueError:
-            relative_path = os.path.basename(image_path)
-
-        output_path = os.path.join(output_folder, relative_path)
-        output_dir = os.path.dirname(output_path)
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        return output_path
-
     def _predict_sample_segmentation(
         self,
         model,
@@ -853,373 +912,6 @@ class YPSetValidation:
     
     # ==================== Drawing & Visualization ====================
 
-    def visualize_segmentation_and_keypoints(
-        self,
-        output_folder: str,
-        model_name: str = "yolo26m-seg",
-        target_class: Union[str, int] = "person",
-        score_threshold: float = 0.5,
-        visibility_threshold: float = 2.0,
-        image_paths: Optional[Sequence[str]] = None,
-        device: Optional[str] = None,
-        verbose: bool = True,
-    ) -> List[str]:
-        """Save visualizations that combine segmentation masks and keypoints.
-
-        For each selected image, this method creates a three-panel image:
-        original image, all detected masks, and an overlay with keypoints plus
-        the best mask-person matches when instance masks are available.
-
-        Args:
-            output_folder: Directory where rendered images will be saved.
-            model_name: Segmentation model name or alias.
-            target_class: Target class name or numeric id.
-            score_threshold: Confidence threshold for instance models.
-            visibility_threshold: Minimum keypoint visibility to draw/use.
-            image_paths: Optional subset of image paths to process. When omitted,
-                the full dataset is rendered.
-            device: Optional inference device.
-            verbose: Show progress bar.
-
-        Returns:
-            List of saved image paths.
-        """
-        os.makedirs(output_folder, exist_ok=True)
-
-        metadata = self._get_segmentation_model_metadata(model_name)
-        target_class_id, _ = self._resolve_segmentation_target_class(
-            metadata["canonical_name"],
-            target_class,
-        )
-        model = self._load_segmentation_model(metadata["canonical_name"])
-
-        if metadata["family"] != "ultralytics_yolo_seg":
-            torch_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-            model = model.to(torch_device)
-            model.eval()
-        else:
-            torch_device = device
-
-        selected_paths = None
-        if image_paths is not None:
-            selected_paths = {os.path.abspath(path) for path in image_paths}
-
-        colors = [
-            (0, 0, 255),
-            (0, 255, 0),
-            (255, 255, 0),
-            (0, 165, 255),
-            (180, 105, 255),
-            (47, 255, 173),
-        ]
-
-        output_paths: List[str] = []
-        iterator = self.dataset
-        if verbose:
-            iterator = tqdm(iterator, total=len(self.dataset), desc="Saving segmentation visualizations")
-
-        for sample in iterator:
-            image_path = sample['image_path']
-            if selected_paths is not None and os.path.abspath(image_path) not in selected_paths:
-                continue
-
-            image = sample['image']
-            height, width = image.shape[:2]
-            person_keypoints = self._get_sample_person_keypoints(sample)
-            segmentation = self._predict_sample_segmentation(
-                model=model,
-                model_family=metadata["family"],
-                sample=sample,
-                target_class=target_class_id,
-                score_threshold=score_threshold,
-                device=torch_device,
-            )
-
-            original_panel = image.copy()
-            all_masks = segmentation["instance_masks"] or [segmentation["mask"]]
-            masks_panel = self._colorize_masks(image.shape, all_masks, colors)
-            overlay = image.copy()
-
-            if segmentation["instance_masks"]:
-                matching = self._match_person_masks_by_localization(
-                    person_keypoints=person_keypoints,
-                    masks=segmentation["instance_masks"],
-                    image_shape=image.shape,
-                    visibility_threshold=visibility_threshold,
-                )
-                assignment = matching["assignment"]
-                pair_metrics = matching["pair_metrics"]
-                person_localizations = matching["person_localizations"]
-
-                for person_idx, keypoints in enumerate(person_keypoints):
-                    color = colors[person_idx % len(colors)]
-                    person_loc = person_localizations[person_idx]
-                    if person_loc is not None:
-                        px1, py1, px2, py2 = [int(round(value)) for value in person_loc["bbox"]]
-                        cv2.rectangle(overlay, (px1, py1), (px2, py2), color, 1)
-                        label_point = (px1, max(20, py1 - 8))
-                    else:
-                        label_point = (10, 25 + person_idx * 18)
-
-                    mask_idx = assignment.get(person_idx)
-                    if mask_idx is not None:
-                        mask = segmentation["instance_masks"][mask_idx]
-                        metrics = pair_metrics[person_idx][mask_idx]
-                        overlay[self._mask_to_binary(mask)] = (
-                            0.65 * overlay[self._mask_to_binary(mask)] + 0.35 * np.array(color)
-                        ).astype(np.uint8)
-
-                        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        cv2.drawContours(overlay, contours, -1, color, 2)
-
-                        if mask_idx < len(segmentation["instance_boxes"]):
-                            x1, y1, x2, y2 = segmentation["instance_boxes"][mask_idx].astype(int)
-                            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
-
-                        cv2.putText(
-                            overlay,
-                            f"P{person_idx} -> M{mask_idx}",
-                            label_point,
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55,
-                            color,
-                            2,
-                            cv2.LINE_AA,
-                        )
-                        cv2.putText(
-                            overlay,
-                            f"cost={metrics['localization_cost']:.3f}",
-                            (label_point[0], min(height - 10, label_point[1] + 18)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.45,
-                            color,
-                            1,
-                            cv2.LINE_AA,
-                        )
-                    else:
-                        cv2.putText(
-                            overlay,
-                            f"P{person_idx} -> no mask",
-                            label_point,
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.55,
-                            color,
-                            2,
-                            cv2.LINE_AA,
-                        )
-
-                    overlay = YPImageValidation.draw_keypoints_on_image(
-                        overlay,
-                        keypoints,
-                        color=color,
-                    )
-            else:
-                mask_binary = self._mask_to_binary(segmentation["mask"])
-                if np.any(mask_binary):
-                    overlay[mask_binary] = (
-                        0.65 * overlay[mask_binary] + 0.35 * np.array(colors[0])
-                    ).astype(np.uint8)
-                for person_idx, keypoints in enumerate(person_keypoints):
-                    overlay = YPImageValidation.draw_keypoints_on_image(
-                        overlay,
-                        keypoints,
-                        color=colors[person_idx % len(colors)],
-                    )
-
-            canvas = np.concatenate([original_panel, masks_panel, overlay], axis=1)
-            output_path = self._build_visualization_output_path(output_folder, image_path)
-            cv2.imwrite(output_path, canvas)
-            output_paths.append(output_path)
-
-        return output_paths
-    
-    def draw_all_keypoints(self, output_folder: str = "output_keypoints",
-                          color: tuple = (0, 255, 0), 
-                          keypoint_size: int = 4,
-                          visibility_threshold: float = 2.0,
-                          verbose: bool = True) -> List[str]:
-        """
-        Draw keypoints on all images in dataset and save results.
-        
-        Handles multiple persons per image and filters keypoints by visibility.
-        
-        Args:
-            output_folder: Folder to save images with drawn keypoints
-            color: RGB color tuple (R, G, B) in range [0, 255]
-            keypoint_size: Radius of drawn keypoints in pixels
-            visibility_threshold: Minimum visibility value to draw keypoint (0=out, 1=hidden, 2=visible)
-            verbose: Show progress bar
-            
-        Returns:
-            List of output image paths
-            
-        Example:
-            >>> validator = YPSetValidation(dataset)
-            >>> output_paths = validator.draw_all_keypoints(
-            ...     "output", color=(0, 255, 0), keypoint_size=4, visibility_threshold=2.0
-            ... )
-        """
-        import os
-        os.makedirs(output_folder, exist_ok=True)
-        
-        output_paths = []
-        processed_images = set()  # Track which images we've already processed
-        
-        iterator = self.dataset._valid_pairs
-        if verbose:
-            try:
-                from tqdm import tqdm
-                iterator = tqdm(iterator, total=len(self.dataset._valid_pairs), desc="Drawing keypoints")
-            except ImportError:
-                pass
-        
-        for image_path, label_path in iterator:
-            # Skip if we've already processed this image
-            image_key = os.path.abspath(image_path)
-            if image_key in processed_images:
-                continue
-            processed_images.add(image_key)
-            
-            # Load image
-            image = cv2.imread(image_path)
-            if image is None:
-                continue
-            
-            # Load ALL keypoints from this image's label file
-            all_keypoints_list = YPImageValidation.load_all_keypoints_from_file(label_path)
-            
-            # Draw all persons on the same image
-            result = image.copy()
-            h, w = image.shape[:2]
-            
-            for keypoints in all_keypoints_list:
-                # Filter keypoints by visibility (if keypoints have 3 columns)
-                if keypoints.shape[1] >= 3:
-                    # Only draw keypoints with visibility >= threshold
-                    for i, (x_norm, y_norm, visibility) in enumerate(keypoints):
-                        if visibility >= visibility_threshold:
-                            px = int(x_norm * w)
-                            py = int(y_norm * h)
-                            cv2.circle(result, (px, py), keypoint_size, color, -1)
-                else:
-                    # If no visibility column, draw all keypoints
-                    for x_norm, y_norm in keypoints:
-                        px = int(x_norm * w)
-                        py = int(y_norm * h)
-                        cv2.circle(result, (px, py), keypoint_size, color, -1)
-            
-            # Save result
-            filename = os.path.basename(image_path)
-            output_path = os.path.join(output_folder, filename)
-            cv2.imwrite(output_path, result)
-            output_paths.append(output_path)
-        
-        return output_paths
-    
-    def draw_all_keypoints_with_patches(self, output_folder: str = "output_patches",
-                                       patch_size: int = 32,
-                                       keypoint_color: tuple = (0, 255, 0),
-                                       patch_color: tuple = (255, 0, 0),
-                                       visibility_threshold: float = 2.0,
-                                       thickness: int = 2,
-                                       verbose: bool = True) -> List[str]:
-        """
-        Draw keypoints and patches on all images in dataset and save results.
-        
-        Handles multiple persons per image and filters keypoints by visibility.
-        
-        Args:
-            output_folder: Folder to save images with patches
-            patch_size: Size of square patches to draw
-            keypoint_color: RGB color tuple for keypoint circles
-            patch_color: RGB color tuple for patch rectangles
-            visibility_threshold: Minimum visibility value to draw keypoint (0=out, 1=hidden, 2=visible)
-            thickness: Line thickness for rectangles. -1 to fill.
-            verbose: Show progress bar
-            
-        Returns:
-            List of output image paths
-            
-        Example:
-            >>> validator = YPSetValidation(dataset)
-            >>> output_paths = validator.draw_all_keypoints_with_patches(
-            ...     "output_patches", patch_size=32, visibility_threshold=2.0
-            ... )
-        """
-        import os
-        os.makedirs(output_folder, exist_ok=True)
-        
-        output_paths = []
-        processed_images = set()  # Track which images we've already processed
-        
-        iterator = self.dataset._valid_pairs
-        if verbose:
-            try:
-                from tqdm import tqdm
-                iterator = tqdm(iterator, total=len(self.dataset._valid_pairs), desc="Drawing key points with patches")
-            except ImportError:
-                pass
-        
-        for image_path, label_path in iterator:
-            # Skip if we've already processed this image
-            image_key = os.path.abspath(image_path)
-            if image_key in processed_images:
-                continue
-            processed_images.add(image_key)
-            
-            # Load image
-            image = cv2.imread(image_path)
-            if image is None:
-                continue
-            
-            # Load ALL keypoints from this image's label file
-            all_keypoints_list = YPImageValidation.load_all_keypoints_from_file(label_path)
-            
-            # Draw all persons on the same image
-            result = image.copy()
-            if len(result.shape) == 2:
-                result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
-            
-            h, w = image.shape[:2]
-            half_patch = patch_size // 2
-            
-            for keypoints in all_keypoints_list:
-                # Filter keypoints by visibility (if keypoints have 3 columns)
-                if keypoints.shape[1] >= 3:
-                    # Only draw keypoints with visibility >= threshold
-                    for i, (x_norm, y_norm, visibility) in enumerate(keypoints):
-                        if visibility >= visibility_threshold:
-                            px = int(x_norm * w)
-                            py = int(y_norm * h)
-                            
-                            # Draw patch rectangle
-                            top_left = (max(0, px - half_patch), max(0, py - half_patch))
-                            bottom_right = (min(w, px + half_patch), min(h, py + half_patch))
-                            cv2.rectangle(result, top_left, bottom_right, patch_color, thickness)
-                            
-                            # Draw keypoint circle
-                            cv2.circle(result, (px, py), 4, keypoint_color, -1)
-                else:
-                    # If no visibility column, draw all keypoints
-                    for x_norm, y_norm in keypoints:
-                        px = int(x_norm * w)
-                        py = int(y_norm * h)
-                        
-                        # Draw patch rectangle
-                        top_left = (max(0, px - half_patch), max(0, py - half_patch))
-                        bottom_right = (min(w, px + half_patch), min(h, py + half_patch))
-                        cv2.rectangle(result, top_left, bottom_right, patch_color, thickness)
-                        
-                        # Draw keypoint circle
-                        cv2.circle(result, (px, py), 4, keypoint_color, -1)
-            
-            # Save result
-            filename = os.path.basename(image_path)
-            output_path = os.path.join(output_folder, filename)
-            cv2.imwrite(output_path, result)
-            output_paths.append(output_path)
-        
-        return output_paths
     
     def _get_distance_matrices(
         self,
@@ -1299,194 +991,7 @@ class YPSetValidation:
             distance_indices = np.array([], dtype=np.int64)
         
         return distance_matrix, paths, distance_indices
-    
 
-    def get_sequential_distances(
-        self,
-        verbose: bool = True,
-        visibility_threshold: float = 2.0,
-        distance_connections: Optional[Sequence[Tuple[int, int]]] = None,
-    ) -> np.ndarray:
-        """Get distances for all persons in all images.
-        
-        Handles multiple persons per image. Returns one distance array per person.
-        By default uses consecutive keypoint pairs. When ``distance_connections``
-        is provided, uses that explicit ordered list of pairs instead.
-        
-        Args:
-            verbose: Show progress bar
-            visibility_threshold: Minimum visibility score (0-1) to consider a keypoint visible.
-                                Default 0.5. Keypoints below this are skipped.
-            distance_connections: Optional ordered list of ``(start_idx, end_idx)``
-                                keypoint pairs to measure instead of consecutive pairs.
-        
-        Returns:
-            Structured numpy array with fields: image_path (str), person_id (int), distances (object array)
-            Access: result['image_path'], result['person_id'], result['distances']
-            
-        Example:
-            >>> results = validator.get_sequential_distances(visibility_threshold=0.5)
-            >>> print(results.shape)  # (num_persons,)
-            >>> print(results['image_path'])  # array of paths
-            >>> print(results['person_id'])   # array of person indices
-            >>> print(results['distances'][0])  # first person's distances
-        """
-        results = []
-        normalized_connections = normalize_distance_connections(distance_connections)
-        
-        iterator = self.dataset
-        if verbose:
-            try:
-                from tqdm import tqdm
-                iterator = tqdm(iterator, total=len(self.dataset), 
-                              desc=f"Computing sequential distances (visibility_threshold={visibility_threshold})")
-            except ImportError:
-                pass
-        
-        for sample in iterator:
-            image_path = sample['image_path']
-            label_path = sample['label_path']
-            image = sample['image']
-            
-            # Load all people from label file
-            all_keypoints = YPImageValidation.load_all_keypoints_from_file(label_path, include_visibility=True)
-            
-            # Compute distances for each person
-            for person_id, kpts in enumerate(all_keypoints):
-                if len(kpts) < 2:
-                    continue
-                
-                validator = YPImageValidation(image, kpts)
-                distances = validator.get_sequential_distances(
-                    visibility_threshold=visibility_threshold,
-                    distance_connections=normalized_connections,
-                )
-                
-                results.append((image_path, person_id, distances))
-        
-        # Convert to structured array
-        if results:
-            structured_array = np.array(results, dtype=[('image_path', 'O'), ('person_id', 'i4'), ('distances', 'O')])
-        else:
-            structured_array = np.array([], dtype=[('image_path', 'O'), ('person_id', 'i4'), ('distances', 'O')])
-        
-        return structured_array
-
-    def get_sequential_angles(self, verbose: bool = True, visibility_threshold: float = 2.0) -> np.ndarray:
-        """Get consecutive-segment angles for all persons in all images.
-
-        Handles multiple persons per image. Returns one angle array per person.
-
-        Args:
-            verbose: Show progress bar.
-            visibility_threshold: Minimum visibility score to consider a keypoint visible.
-
-        Returns:
-            Structured numpy array with fields: ``image_path`` (str),
-            ``person_id`` (int), ``angles`` (object array).
-        """
-        results = []
-
-        iterator = self.dataset
-        if verbose:
-            try:
-                from tqdm import tqdm
-                iterator = tqdm(iterator, total=len(self.dataset),
-                              desc=f"Computing sequential angles (visibility_threshold={visibility_threshold})")
-            except ImportError:
-                pass
-
-        for sample in iterator:
-            image_path = sample['image_path']
-            label_path = sample['label_path']
-            image = sample['image']
-
-            all_keypoints = YPImageValidation.load_all_keypoints_from_file(label_path, include_visibility=True)
-
-            for person_id, kpts in enumerate(all_keypoints):
-                if len(kpts) < 2:
-                    continue
-
-                validator = YPImageValidation(image, kpts)
-                angles = validator.get_sequential_angles(visibility_threshold=visibility_threshold)
-
-                results.append((image_path, person_id, angles))
-
-        if results:
-            structured_array = np.array(results, dtype=[('image_path', 'O'), ('person_id', 'i4'), ('angles', 'O')])
-        else:
-            structured_array = np.array([], dtype=[('image_path', 'O'), ('person_id', 'i4'), ('angles', 'O')])
-
-        return structured_array
-    
-    def count_distances_by_index(
-        self,
-        distances_result: np.ndarray = None,
-        verbose: bool = True,
-        distance_connections: Optional[Sequence[Tuple[int, int]]] = None,
-    ) -> dict:
-        """Count how many distances exist for each distance index across the dataset.
-        
-        Aggregates all distances from all persons and counts occurrences by distance index.
-        
-        Args:
-            distances_result: Result from get_sequential_distances(). If None, computes it.
-            verbose: Show progress and results
-            distance_connections: Optional ordered list of ``(start_idx, end_idx)``
-                                keypoint pairs to measure instead of consecutive pairs
-                                when auto-computing ``distances_result``.
-            
-        Returns:
-            Dictionary mapping distance_index -> count of distances at that index
-            Keys are sorted distance indices, values are integer counts.
-            
-        Example:
-            >>> validator = YPSetValidation(dataset)
-            >>> # Method 1: Provide pre-computed distances
-            >>> distances = validator.get_sequential_distances()
-            >>> counts = validator.count_distances_by_index(distances)
-            >>> print(counts)  # {0: 142, 1: 135, 2: 128, ...}
-            
-            >>> # Method 2: Auto-compute within the method
-            >>> counts = validator.count_distances_by_index()
-            >>> print(counts)  # {0: 142, 1: 135, 2: 128, ...}
-        """
-        # Compute if not provided
-        if distances_result is None:
-            distances_result = self.get_sequential_distances(
-                verbose=verbose,
-                distance_connections=distance_connections,
-            )
-        
-        # Aggregate all distances across all persons
-        index_counts = {}
-        
-        for person_record in distances_result:
-            distances_struct = person_record['distances']
-            
-            if len(distances_struct) == 0:
-                continue
-            
-            # Count occurrences of each distance index
-            for dist_idx in distances_struct['distance_index']:
-                dist_idx_int = int(dist_idx)
-                index_counts[dist_idx_int] = index_counts.get(dist_idx_int, 0) + 1
-        
-        # Sort by index for better readability
-        sorted_counts = dict(sorted(index_counts.items()))
-        
-        if verbose:
-            print("Distance Index Counts (Dataset-wide):")
-            print("-" * 50)
-            for idx in sorted(sorted_counts.keys()):
-                count = sorted_counts[idx]
-                print(f"  Distance Index {idx}: {count:6d} distances")
-            print("-" * 50)
-            print(f"  Total unique indices: {len(sorted_counts)}")
-            print(f"  Total distances: {sum(sorted_counts.values())}")
-        
-        return sorted_counts
-    
     def train_distance_models(
         self,
         model_factory: Union[Callable[[], BaseEstimator], str] = "hist_gradient_boosting",
@@ -1827,125 +1332,27 @@ class YPSetValidation:
             'errors_per_distance': errors_per_distance_sorted,
             'ratios_per_distance': ratios_per_distance_sorted
         }
+
     
     # ==================== LBP Anomaly Detection (Isolation Forest) ====================
 
     @staticmethod
     def _lbp_decimals_to_feature_matrix(decimals: Sequence[Any]) -> np.ndarray:
-        """Convert LBP decimal values to a numeric feature matrix for anomaly models."""
-        return np.array([
-            np.log1p(d.bit_length()) if isinstance(d, int) else np.log1p(float(d))
-            for d in decimals
-        ], dtype=np.float64).reshape(-1, 1)
+        """Convert LBP decimal values to a binary bit feature matrix for anomaly models.
 
-    def _train_isolation_forest_for_lbp_similarity_groups(
-        self,
-        decimals: Sequence[Any],
-        contamination: float = 0.1,
-        random_state: int = 42,
-        n_estimators: int = 100,
-        similarity_threshold: float = 0.95,
-        similarity_k: int = DEFAULT_K_NEIGHBORS,
-        min_group_size: int = 10,
-        verbose: bool = True,
-    ) -> Dict[str, Any]:
-        """Train one Isolation Forest per sufficiently large LBP similarity group."""
-        X = self._lbp_decimals_to_feature_matrix(decimals)
-
-        if X.shape[0] == 0:
-            return {
-                'feature_matrix': X,
-                'similarity_groups': [],
-                'trained_similarity_groups': [],
-                'skipped_similarity_groups': [],
-                'models': [],
-                'predictions': np.array([], dtype=float),
-                'anomaly_scores': np.array([], dtype=float),
-                'normalized_anomaly_scores': np.array([], dtype=float),
-                'group_reports': [],
-            }
-
-        if X.shape[0] <= 1:
-            similarity_groups = []
-        else:
-            effective_k = max(1, min(int(similarity_k), X.shape[0]))
-            grouped_indices = self.build_similarity_groups(
-                X,
-                threshold=similarity_threshold,
-                k=effective_k,
-            )
-            similarity_groups = [sorted(group) for group in grouped_indices]
-
-        similarity_groups.sort(key=lambda group: (-len(group), group[0]))
-        trained_similarity_groups = [group for group in similarity_groups if len(group) > min_group_size]
-        skipped_similarity_groups = [group for group in similarity_groups if len(group) <= min_group_size]
-
-        if verbose:
-            print(
-                f"Training {len(trained_similarity_groups)} Isolation Forest models "
-                f"for {X.shape[0]} LBP samples from groups larger than {min_group_size}..."
-            )
-            if skipped_similarity_groups:
-                print(
-                    f"Skipping {len(skipped_similarity_groups)} similarity groups "
-                    f"with size <= {min_group_size}."
-                )
-
-        all_predictions = np.full(X.shape[0], np.nan, dtype=float)
-        all_scores = np.full(X.shape[0], np.nan, dtype=float)
-        all_normalized_scores = np.full(X.shape[0], np.nan, dtype=float)
-        models: List[IsolationForest] = []
-        group_reports: List[Dict[str, Any]] = []
-
-        for group_idx, group in enumerate(trained_similarity_groups):
-            group_array = np.asarray(group, dtype=int)
-            X_group = X[group_array]
-
-            model = IsolationForest(
-                contamination=contamination,
-                random_state=random_state,
-                n_estimators=n_estimators,
-            )
-            model.fit(X_group)
-
-            group_predictions = model.predict(X_group)
-            group_scores = model.score_samples(X_group)
-
-            min_score = float(np.min(group_scores))
-            max_score = float(np.max(group_scores))
-            if max_score > min_score:
-                group_normalized_scores = 1.0 - (
-                    (group_scores - min_score) / (max_score - min_score)
-                )
-            else:
-                group_normalized_scores = np.zeros_like(group_scores)
-
-            all_predictions[group_array] = group_predictions
-            all_scores[group_array] = group_scores
-            all_normalized_scores[group_array] = group_normalized_scores
-            models.append(model)
-            group_reports.append({
-                'group_id': group_idx,
-                'indices': group_array.copy(),
-                'size': int(group_array.size),
-                'predictions': group_predictions.copy(),
-                'anomaly_scores': group_scores.copy(),
-                'normalized_anomaly_scores': group_normalized_scores.copy(),
-            })
-
-        return {
-            'feature_matrix': X,
-            'similarity_groups': similarity_groups,
-            'trained_similarity_groups': trained_similarity_groups,
-            'skipped_similarity_groups': skipped_similarity_groups,
-            'models': models,
-            'predictions': all_predictions,
-            'anomaly_scores': all_scores,
-            'normalized_anomaly_scores': all_normalized_scores,
-            'group_reports': group_reports,
-        }
-    
-    
+        Each decimal is expanded to its binary representation so that every bit
+        position carries equal weight. Output shape: (N, n_bits) where n_bits is
+        determined by the largest value in the sequence.
+        """
+        int_decimals = [int(d) for d in decimals]
+        if not int_decimals:
+            return np.empty((0, 1), dtype=np.float64)
+        max_val = max(int_decimals)
+        n_bits = max_val.bit_length() if max_val > 0 else 1
+        return np.array(
+            [[(d >> i) & 1 for i in range(n_bits - 1, -1, -1)] for d in int_decimals],
+            dtype=np.float64,
+        )
 
     def predict_lbp_anomalies_by_embedding_groups(
         self,
@@ -2341,15 +1748,17 @@ class YPSetValidation:
                     continue
 
                 decimal_values = [s['decimal_value'] for s in kpt_samples]
-                features = self._lbp_decimals_to_feature_matrix(decimal_values).ravel()
+                features = self._lbp_decimals_to_feature_matrix(decimal_values)  # (N, n_bits)
+                mean_vec = features.mean(axis=0)  # (n_bits,) - typical bit pattern in group
+                distances = np.linalg.norm(features - mean_vec, axis=1)  # (N,) - one scalar per sample
 
-                mean_val = float(np.mean(features))
-                std_val = float(np.std(features))
+                mean_val = float(np.mean(distances))
+                std_val = float(np.std(distances))
 
                 if std_val == 0.0:
-                    z_scores = np.zeros(len(features), dtype=float)
+                    z_scores = np.zeros(len(distances), dtype=float)
                 else:
-                    z_scores = np.abs((features - mean_val) / std_val)
+                    z_scores = np.abs((distances - mean_val) / std_val)
 
                 for sample_info, z_score in zip(kpt_samples, z_scores):
                     sample_info['person_report']['keypoint_anomaly_scores'][keypoint_index] = float(z_score)
@@ -2647,69 +2056,6 @@ class YPSetValidation:
         }
 
     @staticmethod
-    def _load_clip_model(device: str) -> Tuple:
-        """Load CLIP model for image embedding.
-        
-        Args:
-            device: Device to load model on ("cuda" or "cpu")
-            
-        Returns:
-            Tuple of (model, preprocess) for CLIP
-        """
-        model, _, preprocess = open_clip.create_model_and_transforms(
-            CLIP_MODEL_NAME,
-            pretrained=CLIP_MODEL_PRETRAINED
-        )
-        model = model.to(device)
-        model.eval()
-        return model, preprocess
-    
-    @staticmethod
-    def _compute_embeddings(
-        image_folder: str,
-        model,
-        preprocess,
-        device: str
-    ) -> Tuple[np.ndarray, List[str]]:
-        """Compute CLIP embeddings for all images in folder.
-        
-        Args:
-            image_folder: Path to folder with images
-            model: CLIP model instance
-            preprocess: CLIP preprocessing function
-            device: Device for inference
-            
-        Returns:
-            Tuple of (embeddings array, list of filenames)
-        """
-        image_files = [
-            f for f in os.listdir(image_folder)
-            if f.lower().endswith(VALID_IMAGE_EXTENSIONS)
-        ]
-
-        embeddings = []
-        filenames = []
-
-        with torch.no_grad():
-            for filename in tqdm(image_files, desc="Computing embeddings"):
-                path = os.path.join(image_folder, filename)
-
-                try:
-                    image = Image.open(path).convert("RGB")
-                    image = preprocess(image).unsqueeze(0).to(device)
-
-                    embedding = model.encode_image(image)
-                    embedding = embedding / embedding.norm(dim=-1, keepdim=True)
-
-                    embeddings.append(embedding.cpu().numpy())
-                    filenames.append(filename)
-                except Exception:
-                    continue
-
-        embeddings = np.vstack(embeddings).astype("float32")
-        return embeddings, filenames
-    
-    @staticmethod
     def _build_similarity_groups(
         embeddings: np.ndarray,
         threshold: float,
@@ -2812,46 +2158,7 @@ class YPSetValidation:
             List of groups, where each group is a list of image indices
         """
         return YPSetValidation._build_similarity_groups(embeddings, threshold, k)
-    
-    
-    
-    def _diagnose_patch_quality(self, patch: np.ndarray) -> Dict[str, any]:
-        """Diagnose patch quality for GrabCut compatibility.
-        
-        Args:
-            patch: Image patch (3-channel BGR)
-            
-        Returns:
-            Dictionary with diagnostics
-        """
-        # Check for uniform color (low variance)
-        patch_hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-        h_var = np.var(patch_hsv[:, :, 0])
-        s_var = np.var(patch_hsv[:, :, 1])
-        v_var = np.var(patch_hsv[:, :, 2])
-        
-        # Check pixel distribution
-        unique_colors = len(np.unique(patch.reshape(-1, 3), axis=0))
-        total_pixels = patch.shape[0] * patch.shape[1]
-        color_diversity = unique_colors / total_pixels
-        
-        # Check for NaN or invalid values
-        has_nan = np.isnan(patch).any()
-        has_inf = np.isinf(patch).any()
-        
-        is_problematic = (h_var < 1.0 and s_var < 1.0) or color_diversity < 0.01 or has_nan or has_inf
-        
-        return {
-            'h_variance': h_var,
-            's_variance': s_var,
-            'v_variance': v_var,
-            'unique_colors': unique_colors,
-            'color_diversity': color_diversity,
-            'has_nan': has_nan,
-            'has_inf': has_inf,
-            'is_problematic': is_problematic
-        }
-    
+
 
     @staticmethod
     def get_supported_segmentation_models() -> List[str]:
@@ -3145,14 +2452,42 @@ class YPSetValidation:
                 progress_callback=progress_callback,
             )
         else:
-            result = self.segment_dataset_with_torchvision(
-                model=model,
-                target_class=class_index,
-                score_threshold=score_threshold,
-                device=device,
-                verbose=verbose,
-                progress_callback=progress_callback,
-            )
+            torch_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+            model = model.to(torch_device)
+            model.eval()
+
+            full_masks = []
+            image_paths = []
+
+            iterator = self.dataset
+            if verbose:
+                iterator = tqdm(iterator, total=len(self.dataset), desc=f"Segmenting dataset ({metadata['family']})")
+
+            total = len(self.dataset)
+            for idx, sample in enumerate(iterator):
+                try:
+                    segmentation = self._predict_sample_segmentation(
+                        model=model,
+                        model_family=metadata["family"],
+                        sample=sample,
+                        target_class=class_index,
+                        score_threshold=score_threshold,
+                        device=torch_device,
+                    )
+                    full_masks.append(segmentation["mask"])
+                    image_paths.append(sample["image_path"])
+                except Exception as exc:
+                    if verbose:
+                        print(f"Error processing {sample.get('image_path', 'unknown')}: {exc}")
+                    continue
+
+                if progress_callback is not None:
+                    progress_callback(idx + 1, total)
+
+            result = {
+                "masks": full_masks,
+                "image_paths": image_paths,
+            }
 
         result.update(
             {
@@ -3164,147 +2499,12 @@ class YPSetValidation:
         )
         return result
 
-    def segment_dataset_with_torchvision(
-        self,
-        model,
-        target_class: int = 1,
-        score_threshold: float = 0.5,
-        device: Optional[str] = None,
-        verbose: bool = True,
-        progress_callback: Optional[Callable[[int, int], None]] = None,
-    ) -> dict:
-        """Apply a torchvision segmentation model to every image in the dataset.
-
-        Supports two model families:
-
-        * **torchvision.models.detection** (e.g. MaskRCNN) — instance segmentation.
-          Each detected object returns a soft mask; instances whose predicted label
-          equals `target_class` and whose score ≥ `score_threshold` are merged into
-          one binary mask per image.
-
-        * **torchvision.models.segmentation** (e.g. FCN, DeepLabV3) — semantic
-          segmentation.  The per-pixel predicted class is compared against
-          `target_class` to build the binary mask.
-
-        The model is automatically put in eval mode and moved to `device`.
-        Input images are pre-processed with the standard ImageNet transform
-        (ToTensor + Normalize) for semantic models, and with ToTensor only for
-        detection models (as required by torchvision detection API).
-
-        Args:
-            model: A torchvision detection or segmentation model instance.
-            target_class: Class index to extract.  Default 1 = "person" (COCO).
-            score_threshold: Minimum confidence score for detection models
-                (ignored for semantic models).  Default 0.5.
-            device: ``"cuda"`` or ``"cpu"``.  Auto-detected when None.
-            verbose: Show tqdm progress bar.
-
-        Returns:
-            Dictionary with keys:
-            - ``'masks'``: list of (H, W) uint8 binary arrays (0 or 255), one per image.
-            - ``'image_paths'``: list of image paths in dataset order.
-
-        Example:
-            >>> from torchvision.models.detection import maskrcnn_resnet50_fpn, MaskRCNN_ResNet50_FPN_Weights
-            >>> model = maskrcnn_resnet50_fpn(weights=MaskRCNN_ResNet50_FPN_Weights.DEFAULT)
-            >>> result = validator.segment_dataset_with_torchvision(model, target_class=1)
-            >>> masks = result['masks']  # one binary mask per image
-
-            >>> from torchvision.models.segmentation import deeplabv3_resnet50, DeepLabV3_ResNet50_Weights
-            >>> model = deeplabv3_resnet50(weights=DeepLabV3_ResNet50_Weights.DEFAULT)
-            >>> result = validator.segment_dataset_with_torchvision(model, target_class=15)  # 15 = person in VOC
-        """
-        import torchvision.transforms.functional as TF
-
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        model = model.to(device)
-        model.eval()
-
-        # ---- detect model family ----------------------------------------
-        model_module = type(model).__module__
-        if "detection" in model_module:
-            model_type = "detection"
-        elif "segmentation" in model_module:
-            model_type = "segmentation"
-        else:
-            raise ValueError(
-                f"Cannot determine model family from module '{model_module}'. "
-                "Pass a model from torchvision.models.detection or "
-                "torchvision.models.segmentation."
-            )
-
-        # ImageNet normalisation used by semantic segmentation models
-        _mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(3, 1, 1)
-        _std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(3, 1, 1)
-
-        # ---- output containers ------------------------------------------
-        full_masks  = []
-        image_paths = []
-
-        iterator = self.dataset
-        if verbose:
-            iterator = tqdm(iterator, total=len(self.dataset),
-                            desc=f"Segmenting dataset ({model_type})")
-
-        total = len(self.dataset)
-        with torch.no_grad():
-            for idx, sample in enumerate(iterator):
-                try:
-                    image      = sample['image']       # BGR uint8
-                    image_path = sample['image_path']
-                    h, w       = image.shape[:2]
-
-                    # Convert BGR → RGB float tensor [C, H, W] in [0, 1]
-                    img_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                    img_t   = TF.to_tensor(img_rgb).to(device)  # (3, H, W), float32 in [0,1]
-
-                    # ---- forward pass -----------------------------------
-                    if model_type == "detection":
-                        # Detection API expects a list of un-normalised tensors
-                        output    = model([img_t])
-                        labels    = output[0]["labels"]          # (N,)
-                        scores    = output[0]["scores"]          # (N,)
-                        inst_masks = output[0]["masks"]          # (N, 1, H, W)
-
-                        keep = (labels == target_class) & (scores >= score_threshold)
-                        if keep.any():
-                            soft = inst_masks[keep, 0]           # (K, H, W)
-                            combined = soft.max(dim=0).values    # (H, W)
-                            binary = (combined > 0.5).cpu().numpy().astype(np.uint8) * 255
-                        else:
-                            binary = np.zeros((h, w), dtype=np.uint8)
-
-                    else:  # semantic segmentation
-                        # Normalise with ImageNet stats
-                        img_norm   = (img_t - _mean) / _std
-                        img_batch  = img_norm.unsqueeze(0)       # (1, 3, H, W)
-                        output     = model(img_batch)["out"]     # (1, C, H, W)
-                        pred_class = output.argmax(dim=1).squeeze(0).cpu().numpy()  # (H, W)
-                        binary     = (pred_class == target_class).astype(np.uint8) * 255
-
-                    full_masks.append(binary)
-                    image_paths.append(image_path)
-
-                except Exception as e:
-                    if verbose:
-                        print(f"Error processing {sample.get('image_path', 'unknown')}: {e}")
-                    continue
-                
-                if progress_callback is not None:
-                    progress_callback(idx + 1, total)
-
-        return {
-            "masks":       full_masks,
-            "image_paths": image_paths,
-        }
-
     def evaluate_dataset_keypoints_against_masks(
         self,
         masks: Sequence[np.ndarray],
         image_paths: Optional[Sequence[str]] = None,
         visibility_threshold: Optional[float] = 2.0,
+        mask_tolerance_px: int = 12,
         verbose: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> Dict[str, Any]:
@@ -3318,6 +2518,8 @@ class YPSetValidation:
             image_paths: Optional paths aligned with ``masks``. When provided,
                 masks are matched by image path instead of dataset order.
             visibility_threshold: Optional visibility threshold for keypoints.
+            mask_tolerance_px: Pixel tolerance used for inside-mask checks.
+                ``0`` means exact pixel-only matching; ``1`` checks 3x3 neighborhood.
             verbose: Show tqdm progress bar.
 
         Returns:
@@ -3372,6 +2574,7 @@ class YPSetValidation:
                         validator.evaluate_keypoints_against_mask(
                             mask=mask,
                             visibility_threshold=visibility_threshold,
+                            mask_tolerance_px=mask_tolerance_px,
                         )
                     )
                 results.append({
@@ -3387,6 +2590,7 @@ class YPSetValidation:
                     "keypoint_metrics": validator.evaluate_keypoints_against_mask(
                         mask=mask,
                         visibility_threshold=visibility_threshold,
+                        mask_tolerance_px=mask_tolerance_px,
                     ),
                 })
 
@@ -3399,6 +2603,7 @@ class YPSetValidation:
             "images": results,
             "image_paths": processed_paths,
             "visibility_threshold": visibility_threshold,
+            "mask_tolerance_px": int(mask_tolerance_px),
         }
 
     def _prepare_keypoint_mask_distance_datasets(
@@ -3706,7 +2911,7 @@ class YPSetValidation:
     def collect_visible_keypoints_outside_masks(
         self,
         evaluation_results: Dict[str, Any],
-    ) -> Dict[str, List[Dict[str, Any]]]:
+    ) -> Dict[str, Any]:
         """Collect visible keypoints, separating those outside masks from those without masks.
 
         The input must come from ``evaluate_dataset_keypoints_against_masks``
@@ -3725,6 +2930,10 @@ class YPSetValidation:
             Dictionary with keys:
             - ``outside_masks``: list of records with visible keypoints outside masks
             - ``without_masks``: list of records with visible keypoints from empty masks
+            - ``outside_persons``: unique person-level records containing outside keypoint counts
+            - ``without_mask_persons``: unique person-level records from images without masks
+            - ``outside_person_count``: number of unique persons with outside keypoints
+            - ``without_mask_person_count``: number of unique persons without masks
             
             Each record contains:
             - ``image_path``
@@ -3786,7 +2995,61 @@ class YPSetValidation:
                     else:
                         without_masks.append(record)
 
+        outside_person_map: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        without_mask_person_map: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+        for record in outside_masks:
+            key = (os.path.normcase(str(record["image_path"])), int(record["person_index"]))
+            bucket = outside_person_map.setdefault(
+                key,
+                {
+                    "image_path": record["image_path"],
+                    "person_index": int(record["person_index"]),
+                    "outside_keypoint_count": 0,
+                    "outside_keypoint_indices": [],
+                },
+            )
+            kp_idx = int(record["keypoint_index"])
+            if kp_idx not in bucket["outside_keypoint_indices"]:
+                bucket["outside_keypoint_indices"].append(kp_idx)
+                bucket["outside_keypoint_count"] += 1
+
+        for record in without_masks:
+            key = (os.path.normcase(str(record["image_path"])), int(record["person_index"]))
+            bucket = without_mask_person_map.setdefault(
+                key,
+                {
+                    "image_path": record["image_path"],
+                    "person_index": int(record["person_index"]),
+                    "outside_keypoint_count": 0,
+                    "outside_keypoint_indices": [],
+                },
+            )
+            kp_idx = int(record["keypoint_index"])
+            if kp_idx not in bucket["outside_keypoint_indices"]:
+                bucket["outside_keypoint_indices"].append(kp_idx)
+                bucket["outside_keypoint_count"] += 1
+
+        outside_persons = sorted(
+            outside_person_map.values(),
+            key=lambda item: (
+                os.path.normcase(str(item.get("image_path"))),
+                int(item.get("person_index", -1)),
+            ),
+        )
+        without_mask_persons = sorted(
+            without_mask_person_map.values(),
+            key=lambda item: (
+                os.path.normcase(str(item.get("image_path"))),
+                int(item.get("person_index", -1)),
+            ),
+        )
+
         return {
             "outside_masks": outside_masks,
             "without_masks": without_masks,
+            "outside_persons": outside_persons,
+            "without_mask_persons": without_mask_persons,
+            "outside_person_count": len(outside_persons),
+            "without_mask_person_count": len(without_mask_persons),
         }

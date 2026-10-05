@@ -1,0 +1,11 @@
+numpy==2.5.3
+opencv-python==5.0.0.93
+pandas==3.0.6
+Pillow==12.3.0
+tqdm==4.70.1
+scikit-learn==1.9.1
+torch==2.14.1
+ultralytics==8.4.173
+streamlit==1.65.0
+open-clip-torch==3.3.0
+faiss-cpu==1.15.1

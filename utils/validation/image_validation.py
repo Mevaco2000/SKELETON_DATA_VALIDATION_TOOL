@@ -1,5 +1,5 @@
-"""Single image LBP validation methods."""
 
+import os
 from typing import Union, List, Optional, Sequence, Tuple
 import numpy as np
 import cv2
@@ -73,6 +73,17 @@ def _parse_yolo_keypoint_values(values: List[float], include_visibility: bool, k
         return np.empty((0, column_count), dtype=float)
 
     return np.asarray(keypoints, dtype=float)
+
+
+def _parse_yolo_pose_label_line(
+    line: str,
+    include_visibility: bool,
+    keypoint_format: str,
+) -> np.ndarray:
+    """Parse one YOLO pose label line into keypoints array."""
+    parts = line.split()
+    values = list(map(float, parts[5:]))  # Skip class_id, x, y, width, height
+    return _parse_yolo_keypoint_values(values, include_visibility, keypoint_format)
 
 
 def normalize_distance_connections(
@@ -351,63 +362,13 @@ class YPImageValidation:
 
         return result
     
-    def get_sequential_distances(
-        self,
-        visibility_threshold: float = 2.0,
-        distance_connections: Optional[Sequence[Tuple[int, int]]] = None,
-    ) -> np.ndarray:
-        """
-        Compute distances between visible keypoint pairs.
-        
-        By default computes consecutive distances. When ``distance_connections``
-        is provided, computes distances for those explicit keypoint pairs.
-        
-        Args:
-            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
-                                Default 2.0 (only fully visible keypoints).
-            distance_connections: Optional ordered list of ``(start_idx, end_idx)``
-                                keypoint pairs to measure instead of consecutive pairs.
-        
-        Returns:
-            Structured array with fields 'distance_index' (int) and 'distance' (float).
-            Each row represents one distance between visible keypoint pairs.
-            Distance indices refer to the position within the active connection list.
-            
-        Example:
-            >>> validator = YPImageValidation(image, keypoints)
-            >>> distances = validator.get_sequential_distances(visibility_threshold=0.5)
-            >>> print(distances)  # array([(0, 0.5), (2, 1.2), (3, 0.8), ...]) (note: index 1 skipped if keypoint[1] hidden)
-            >>> print(distances['distance_index'])  # [0, 2, 3, ...] (absolute indices)
-            >>> print(distances['distance'])        # [0.5, 1.2, 0.8, ...]
-        """
-        return YPImageValidation.compute_sequential_distances(
-            self.keypoints_norm,
-            visibility_threshold=visibility_threshold,
-            distance_connections=distance_connections,
-        )
-
-    def get_sequential_angles(self, visibility_threshold: float = 2.0) -> np.ndarray:
-        """Compute angles between consecutive visible keypoints.
-
-        Args:
-            visibility_threshold: Minimum visibility score (0=out, 1=hidden, 2=visible).
-                Default 2.0 (only fully visible keypoints).
-
-        Returns:
-            Structured array with fields ``angle_index`` and ``angle``.
-            Each row corresponds to the segment from keypoint[i] to keypoint[i+1].
-        """
-        return YPImageValidation.compute_sequential_angles(
-            self.keypoints_norm,
-            visibility_threshold=visibility_threshold,
-        )
-
     @staticmethod
     def compute_keypoint_mask_metrics(
         keypoints: np.ndarray,
         mask: np.ndarray,
         image_shape: tuple,
         visibility_threshold: Optional[float] = 2.0,
+        mask_tolerance_px: int = 12,
     ) -> np.ndarray:
         """Compute mask-membership and horizontal edge distances for keypoints.
 
@@ -429,6 +390,10 @@ class YPImageValidation:
             visibility_threshold: If provided and keypoints include visibility,
                 keypoints below this threshold return ``inside_mask=0`` and
                 ``NaN`` distances.
+            mask_tolerance_px: Pixel tolerance used when checking if a keypoint
+                is inside the mask. A value of 0 requires an exact pixel hit.
+                Values > 0 mark a keypoint as inside when any foreground pixel
+                exists in the local ``(2*t+1) x (2*t+1)`` neighborhood.
 
         Returns:
             Structured array with fields:
@@ -468,6 +433,8 @@ class YPImageValidation:
             coords[:, 0] *= width
             coords[:, 1] *= height
 
+        tolerance_px = max(int(mask_tolerance_px), 0)
+
         results = []
         for keypoint_index, (x_coord, y_coord) in enumerate(coords):
             is_visible = 1
@@ -483,20 +450,48 @@ class YPImageValidation:
 
             pixel_x = int(np.clip(np.round(x_coord), 0, width - 1))
             pixel_y = int(np.clip(np.round(y_coord), 0, height - 1))
-            row_indices = np.flatnonzero(mask_array[pixel_y])
+            if tolerance_px > 0:
+                x_min = max(0, pixel_x - tolerance_px)
+                x_max = min(width - 1, pixel_x + tolerance_px)
+                y_min = max(0, pixel_y - tolerance_px)
+                y_max = min(height - 1, pixel_y + tolerance_px)
+                inside_mask = int(np.any(mask_array[y_min:y_max + 1, x_min:x_max + 1]))
+            else:
+                inside_mask = int(mask_array[pixel_y, pixel_x])
 
-            if row_indices.size == 0:
-                results.append((keypoint_index, is_visible, 0, np.nan, np.nan))
-                continue
+            row_y = pixel_y
+            row_indices = np.flatnonzero(mask_array[row_y])
+            if row_indices.size == 0 and tolerance_px > 0:
+                for offset in range(1, tolerance_px + 1):
+                    for candidate_y in (pixel_y - offset, pixel_y + offset):
+                        if 0 <= candidate_y < height:
+                            candidate_indices = np.flatnonzero(mask_array[candidate_y])
+                            if candidate_indices.size > 0:
+                                row_y = candidate_y
+                                row_indices = candidate_indices
+                                break
+                    if row_indices.size > 0:
+                        break
 
-            inside_mask = int(mask_array[pixel_y, pixel_x])
             if inside_mask:
-                left_idx = pixel_x
-                right_idx = pixel_x
+                if row_indices.size == 0:
+                    left_distance = np.nan
+                    right_distance = np.nan
+                    results.append((keypoint_index, is_visible, inside_mask, left_distance, right_distance))
+                    continue
 
-                while left_idx > 0 and mask_array[pixel_y, left_idx - 1]:
+                if mask_array[row_y, pixel_x]:
+                    seed_x = pixel_x
+                else:
+                    nearest_idx = int(np.argmin(np.abs(row_indices.astype(float) - float(x_coord))))
+                    seed_x = int(row_indices[nearest_idx])
+
+                left_idx = seed_x
+                right_idx = seed_x
+
+                while left_idx > 0 and mask_array[row_y, left_idx - 1]:
                     left_idx -= 1
-                while right_idx < width - 1 and mask_array[pixel_y, right_idx + 1]:
+                while right_idx < width - 1 and mask_array[row_y, right_idx + 1]:
                     right_idx += 1
 
                 left_edge = float(left_idx)
@@ -525,6 +520,7 @@ class YPImageValidation:
         self,
         mask: np.ndarray,
         visibility_threshold: Optional[float] = 2.0,
+        mask_tolerance_px: int = 12,
     ) -> np.ndarray:
         """Evaluate all image keypoints against a binary mask.
 
@@ -532,6 +528,7 @@ class YPImageValidation:
             mask: Binary mask with the same height and width as the image.
             visibility_threshold: Optional visibility threshold. If provided,
                 hidden keypoints return ``inside_mask=0`` and ``NaN`` distances.
+            mask_tolerance_px: Pixel tolerance used for inside-mask checks.
 
         Returns:
             Structured array with ``keypoint_index``, ``is_visible``, ``inside_mask``,
@@ -542,92 +539,8 @@ class YPImageValidation:
             mask=mask,
             image_shape=(self.h, self.w),
             visibility_threshold=visibility_threshold,
+            mask_tolerance_px=mask_tolerance_px,
         )
-    
-    @staticmethod
-    def divide_distances_by_index(distances: np.ndarray) -> dict:
-        """
-        Divide distances into separate arrays organized by distance index.
-        
-        Groups structured distance array by the 'distance_index' field.
-        Returns a dictionary where keys are distance indices and values are
-        arrays containing all distances for that index.
-        
-        Args:
-            distances: Structured array with fields 'distance_index' (int) and 'distance' (float).
-                      Typically output from sequential_distances() or get_sequential_distances().
-        
-        Returns:
-            Dictionary mapping distance_index -> array of distance values
-            Keys are sorted distance indices found in the data.
-            
-        Example:
-            >>> validator = YPImageValidation(image, keypoints)
-            >>> distances = validator.sequential_distances()
-            >>> grouped = YPImageValidation.divide_distances_by_index(distances)
-            >>> print(grouped.keys())  # dict_keys([0, 1, 3, 5])
-            >>> print(grouped[0])      # array of distances at index 0
-            >>> print(grouped[1])      # array of distances at index 1
-        """
-        if len(distances) == 0:
-            return {}
-        
-        # Get unique indices and sort them
-        unique_indices = np.unique(distances['distance_index'])
-        
-        # Create dictionary grouping distances by index
-        grouped = {}
-        for idx in unique_indices:
-            mask = distances['distance_index'] == idx
-            grouped[int(idx)] = distances['distance'][mask]
-        
-        return grouped
-    
-    @staticmethod
-    def distances_by_index_to_matrix(distances: np.ndarray, fill_value: float = np.nan) -> tuple:
-        """
-        Convert grouped distances into a matrix format.
-        
-        Creates a 2D array where each column represents a distance index,
-        padded with fill_value where data is missing.
-        
-        Args:
-            distances: Structured array with 'distance_index' and 'distance' fields.
-            fill_value: Value to use for missing distances (default: np.nan).
-        
-        Returns:
-            Tuple of (matrix, indices) where:
-            - matrix: 2D array of shape (num_groups, num_indices) with distances
-            - indices: Array of distance indices corresponding to columns
-            
-        Example:
-            >>> distances = validator.sequential_distances()  # from single image
-            >>> matrix, indices = YPImageValidation.distances_by_index_to_matrix(distances)
-            >>> print(indices)   # [0, 1, 2, 3]
-            >>> print(matrix.shape)  # e.g., (17, 4) if 17 keypoints and 4 indices
-        """
-        if len(distances) == 0:
-            return np.array([], dtype=np.float64), np.array([], dtype=np.int64)
-        
-        grouped = YPImageValidation.divide_distances_by_index(distances)
-        
-        if not grouped:
-            return np.array([], dtype=np.float64), np.array([], dtype=np.int64)
-        
-        # Get sorted indices
-        sorted_indices = sorted(grouped.keys())
-        
-        # Find max length of any distance group
-        max_len = max(len(group) for group in grouped.values())
-        
-        # Create matrix with padding
-        matrix = np.full((max_len, len(sorted_indices)), fill_value, dtype=np.float64)
-        
-        for col_idx, dist_idx in enumerate(sorted_indices):
-            distances_for_index = grouped[dist_idx]
-            matrix[:len(distances_for_index), col_idx] = distances_for_index
-        
-        return matrix, np.array(sorted_indices, dtype=np.int64)
     
     @staticmethod
     def _patch_to_binary_decimal(patch: np.ndarray, center_value: float = None) -> dict:
@@ -766,10 +679,8 @@ class YPImageValidation:
             ...     image, keypoints, color=(0, 255, 0), keypoint_size=4
             ... )
         """
-        import copy
-
-        result = copy.copy(image)
-        h, w = image.shape[:2] if len(image.shape) >= 2 else (image.shape[0], image.shape[1])
+        result = image.copy()
+        h, w = image.shape[:2]
         
         if len(result.shape) == 2:
             result = cv2.cvtColor(result, cv2.COLOR_GRAY2BGR)
@@ -854,8 +765,6 @@ class YPImageValidation:
             >>> keypoints = YPImageValidation.load_keypoints("image.txt")
             >>> print(keypoints.shape)  # (9, 3) - 9 keypoints with visibility
         """
-        import os
-        
         if not os.path.exists(label_path):
             raise FileNotFoundError(f"Label file not found: {label_path}")
         
@@ -865,11 +774,7 @@ class YPImageValidation:
         if not line:
             return np.array([])
         
-        # YOLO Pose 1.0 format: class_id bbox_x bbox_y bbox_w bbox_h px1 py1 v1 px2 py2 v2 ... pxn pyn vn
-        parts = line.split()
-        values = list(map(float, parts[5:]))  # Skip class_id, x, y, width, height (5 values total)
-        
-        return _parse_yolo_keypoint_values(values, include_visibility, keypoint_format)
+        return _parse_yolo_pose_label_line(line, include_visibility, keypoint_format)
     
     @classmethod
     def load_all_keypoints_from_file(
@@ -900,8 +805,6 @@ class YPImageValidation:
             >>> print(len(all_kpts))  # 3
             >>> print(all_kpts[0].shape)  # (9, 3) - first person, 9 keypoints
         """
-        import os
-        
         if not os.path.exists(label_path):
             raise FileNotFoundError(f"Label file not found: {label_path}")
         
@@ -912,11 +815,7 @@ class YPImageValidation:
                 if not line:
                     continue
                 
-                # YOLO Pose 1.0 format: class_id bbox_x bbox_y bbox_w bbox_h px1 py1 v1 px2 py2 v2 ... pxn pyn vn
-                parts = line.split()
-                values = list(map(float, parts[5:]))  # Skip class_id, x, y, width, height (5 values total)
-                
-                keypoints = _parse_yolo_keypoint_values(values, include_visibility, keypoint_format)
+                keypoints = _parse_yolo_pose_label_line(line, include_visibility, keypoint_format)
                 if keypoints.size > 0:
                     all_keypoints.append(keypoints)
         
