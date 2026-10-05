@@ -320,7 +320,13 @@ def run_ranking(
     segmentation_mask_tolerance_px: int,
     distance_model_name: str,
     distance_sort_by: str,
+    progress_callback=None,
 ) -> Tuple[Dict, MergedRankingEvaluator, YPSetValidation, Optional[KeypointDatasetAdapter], Path]:
+    def _emit(progress_value: int, message: str) -> None:
+        if progress_callback is not None:
+            progress_callback(int(progress_value), str(message))
+
+    _emit(5, "Resolving dataset representation")
     adapter: Optional[KeypointDatasetAdapter] = None
 
     if source_format == "yolo_pose":
@@ -340,6 +346,7 @@ def run_ranking(
         dataset = adapter.as_yolo_dataset()
         dataset_file = Path(adapter.info().get("converted_dataset_file", ""))
 
+    _emit(30, "Initializing dataset validator")
     validator = YPSetValidation(dataset)
 
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -348,6 +355,7 @@ def run_ranking(
     run_dir.mkdir(parents=True, exist_ok=True)
     output_report = run_dir / "ranking_report.txt"
 
+    _emit(45, "Preparing merged ranking evaluator")
     evaluator = MergedRankingEvaluator(
         validator=validator,
         report_paths={},
@@ -363,10 +371,12 @@ def run_ranking(
         segmentation_mask_tolerance_px=segmentation_mask_tolerance_px,
     )
 
+    _emit(60, "Running ranking models")
     results = evaluator.run(distance_weight, lbp_weight, segmentation_weight)
     if not results:
         raise RuntimeError("Ranking was not generated. Check the selected weights.")
 
+    _emit(85, "Saving ranking artifacts")
     ranking = results["combined_ranking"]
     ranking_df = pd.DataFrame(ranking)
     ranking_df.to_csv(run_dir / "combined_ranking.csv", index=False)
@@ -378,6 +388,7 @@ def run_ranking(
             )
 
     results["run_dir"] = str(run_dir)
+    _emit(100, "Merged ranking stage completed")
     return results, evaluator, validator, adapter, dataset_file
 
 
@@ -726,23 +737,29 @@ if run_button:
                 st.error("Please upload a dataset ZIP file before running ranking.")
                 st.stop()
 
-        progress_placeholder = st.empty()
-        progress_bar = st.progress(0, text="Starting...")
+        st.subheader("Pipeline progress")
+        stage1_bar = st.progress(0, text="1/5 Dataset source: waiting")
+        stage2_bar = st.progress(0, text="2/5 Merged ranking: waiting")
+        stage3_bar = st.progress(0, text="3/5 Lookup tables: waiting")
+        stage4_bar = st.progress(0, text="4/5 Annotated outputs: waiting")
+        stage5_bar = st.progress(0, text="5/5 Render results: waiting")
 
         if source_mode == "Upload ZIP":
-            progress_placeholder.info("Step 1/5: Extracting uploaded dataset ZIP")
-            progress_bar.progress(10, text="Extracting ZIP")
+            stage1_bar.progress(20, text="1/5 Dataset source: extracting uploaded ZIP")
             dataset_source_path = _extract_uploaded_zip(uploaded_zip)
+            stage1_bar.progress(100, text="1/5 Dataset source: ready")
         else:
-            progress_placeholder.info("Step 1/5: Resolving dataset source path")
-            progress_bar.progress(10, text="Resolving dataset source")
+            stage1_bar.progress(20, text="1/5 Dataset source: resolving path/URL")
             dataset_source_path = resolve_dataset_source(dataset_source)
+            stage1_bar.progress(100, text="1/5 Dataset source: ready")
 
-        progress_placeholder.info("Step 2/5: Running merged ranking pipeline")
-        progress_bar.progress(30, text="Running merged ranking pipeline")
+        stage2_bar.progress(5, text="2/5 Merged ranking: starting")
 
         resolved_seg_model = segmentation_model_name if use_segmentation else None
         resolved_seg_weight = segmentation_weight if use_segmentation else 0.0
+
+        def _ranking_progress(current: int, message: str) -> None:
+            stage2_bar.progress(max(1, min(100, int(current))), text=f"2/5 Merged ranking: {message}")
 
         results, evaluator, validator, adapter, dataset_file = run_ranking(
             dataset_source_path=dataset_source_path,
@@ -760,26 +777,29 @@ if run_button:
             segmentation_mask_tolerance_px=int(segmentation_mask_tolerance_px),
             distance_model_name=distance_model_name,
             distance_sort_by=distance_sort_by,
+            progress_callback=_ranking_progress,
         )
+        stage2_bar.progress(100, text="2/5 Merged ranking: done")
 
         ranking_rows = results.get("combined_ranking", [])
         run_dir = Path(results["run_dir"])
 
-        progress_placeholder.info("Step 3/5: Building visualization lookups")
-        progress_bar.progress(60, text="Preparing lookup tables")
+        stage3_bar.progress(20, text="3/5 Lookup tables: building")
         dataset_lookup = _build_dataset_lookup(validator)
+        stage3_bar.progress(50, text="3/5 Lookup tables: faulty keypoints")
         faulty_lookup = _build_faulty_keypoint_lookup(evaluator)
+        stage3_bar.progress(80, text="3/5 Lookup tables: segmentation masks")
         mask_lookup = _build_mask_lookup(evaluator)
+        stage3_bar.progress(100, text="3/5 Lookup tables: done")
 
-        progress_placeholder.info("Step 4/5: Saving annotated top outputs")
-        progress_bar.progress(70, text="Saving annotated outputs")
+        stage4_bar.progress(5, text="4/5 Annotated outputs: starting")
 
         def _save_progress(current: int, total: int) -> None:
             if total <= 0:
                 return
             local_ratio = current / total
-            value = 70 + int(local_ratio * 25)
-            progress_bar.progress(min(value, 95), text=f"Saving annotated outputs ({current}/{total})")
+            value = 5 + int(local_ratio * 95)
+            stage4_bar.progress(min(value, 100), text=f"4/5 Annotated outputs: {current}/{total}")
 
         annotated_df = save_annotated_outputs(
             run_dir=run_dir,
@@ -790,9 +810,9 @@ if run_button:
             mask_lookup=mask_lookup,
             progress_callback=_save_progress,
         )
+        stage4_bar.progress(100, text="4/5 Annotated outputs: done")
 
-        progress_placeholder.info("Step 5/5: Rendering results")
-        progress_bar.progress(98, text="Rendering results")
+        stage5_bar.progress(30, text="5/5 Render results: preparing tables")
 
         st.success("Done.")
         st.write(f"Resolved source: {dataset_source_path}")
@@ -816,9 +836,9 @@ if run_button:
             value=max(1, preview_default),
             step=1,
         )
+        stage5_bar.progress(75, text="5/5 Render results: rendering previews")
         render_preview(annotated_df, preview_limit)
-        progress_bar.progress(100, text="Completed")
-        progress_placeholder.success("All steps completed successfully.")
+        stage5_bar.progress(100, text="5/5 Render results: done")
 
     except Exception as exc:
         st.error(f"Error: {exc}")
