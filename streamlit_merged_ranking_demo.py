@@ -4,7 +4,7 @@ import os
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
 
@@ -55,6 +55,45 @@ def _find_dataset_file(search_root: Path) -> Path:
     raise FileNotFoundError(
         "Could not find data.yaml / dataset.yaml / train.txt in the provided dataset source."
     )
+
+
+def _looks_like_dataset_dir(path: Path) -> bool:
+    marker_files = {"data.yaml", "data.yml", "dataset.yaml", "dataset.yml", "train.txt"}
+    try:
+        child_names = {child.name.lower() for child in path.iterdir()}
+    except Exception:
+        return False
+
+    if child_names & marker_files:
+        return True
+
+    has_images = "images" in child_names
+    has_labels = "labels" in child_names
+    has_annotations = "annotations" in child_names
+    return (has_images and has_labels) or has_annotations
+
+
+def _list_candidate_dataset_dirs(base_dir: Path, max_depth: int = 3, max_results: int = 300) -> List[str]:
+    if not base_dir.exists() or not base_dir.is_dir():
+        return []
+
+    base_dir = base_dir.resolve()
+    base_depth = len(base_dir.parts)
+    candidates: List[str] = []
+
+    for root, dirs, _ in os.walk(base_dir):
+        root_path = Path(root)
+        depth = len(root_path.parts) - base_depth
+        if depth > max_depth:
+            dirs[:] = []
+            continue
+
+        if _looks_like_dataset_dir(root_path):
+            candidates.append(str(root_path))
+            if len(candidates) >= max_results:
+                break
+
+    return sorted(set(candidates))
 
 
 def resolve_dataset_source(dataset_source: str) -> Path:
@@ -473,6 +512,76 @@ SEGMENTATION_CLASS_OPTIONS = {
 
 with st.sidebar:
     st.header("Input")
+
+    st.caption("Dataset source")
+    dataset_source_mode = st.radio(
+        "How do you want to provide input data?",
+        options=["Path or URL", "Pick local folder on server", "Upload ZIP"],
+        index=0,
+        help=(
+            "Path or URL: manual path/URL. Pick local folder on server: choose a folder visible to this app. "
+            "Upload ZIP: upload a dataset archive from your computer."
+        ),
+    )
+
+    dataset_source = ""
+    if dataset_source_mode == "Path or URL":
+        dataset_source = st.text_input(
+            "Dataset path or URL",
+            value="",
+            help=(
+                "Accepted values: local directory, local file (.yaml/.yml/.txt/.json), or URL to .zip/.yaml/.yml/.txt/.json. "
+                "Examples: /data/my_dataset, C:/datasets/pose/train.txt, https://.../dataset.zip"
+            ),
+        )
+
+    elif dataset_source_mode == "Pick local folder on server":
+        default_scan_root = str(APP_DIR)
+        scan_root_input = st.text_input(
+            "Scan root directory",
+            value=default_scan_root,
+            help="Directory to scan for dataset folders (contains train.txt / data.yaml / dataset.yaml / images+labels).",
+        )
+        scan_root_path = Path(scan_root_input).expanduser()
+        folder_candidates = _list_candidate_dataset_dirs(scan_root_path)
+
+        if folder_candidates:
+            dataset_source = st.selectbox(
+                "Select dataset folder",
+                options=folder_candidates,
+                help="Choose one detected dataset folder.",
+            )
+        else:
+            st.warning("No dataset-like folders found under the selected scan root.")
+            dataset_source = st.text_input(
+                "Fallback dataset path",
+                value="",
+                help="Enter a directory path manually if automatic detection found no candidates.",
+            )
+
+    else:
+        uploaded_zip = st.file_uploader(
+            "Upload dataset ZIP",
+            type=["zip"],
+            help="Upload a ZIP that contains data.yaml/dataset.yaml/train.txt or a valid dataset folder structure.",
+        )
+        if uploaded_zip is not None:
+            upload_dir = CACHE_DIR / "uploaded_archives"
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            target_zip_path = upload_dir / uploaded_zip.name
+            with open(target_zip_path, "wb") as zip_handle:
+                zip_handle.write(uploaded_zip.getbuffer())
+            dataset_source = str(target_zip_path)
+            st.info(f"Uploaded archive saved to: {target_zip_path}")
+
+    with st.expander("What does 'Dataset path or URL' mean?", expanded=False):
+        st.markdown(
+            "- A **directory** containing your dataset files.\n"
+            "- A **YOLO file** such as `train.txt`, `data.yaml`, or `dataset.yaml`.\n"
+            "- A **COCO JSON file** or directory (when `Input dataset format` is `coco_keypoints`).\n"
+            "- A **remote URL** to `.zip`, `.yaml`, `.yml`, `.txt`, or `.json`."
+        )
+
     format_options = FORMAT_REGISTRY.list_formats()
     default_format_index = format_options.index("yolo_pose") if "yolo_pose" in format_options else 0
     source_format = st.selectbox(
@@ -480,12 +589,6 @@ with st.sidebar:
         options=format_options,
         index=default_format_index,
         help="Select the format of your source dataset. Non-YOLO formats are converted internally.",
-    )
-
-    dataset_source = st.text_input(
-        "Dataset path or URL",
-        value="",
-        help="Local directory or file (.yaml/.yml/.txt/.json), or URL (.zip/.yaml/.yml/.txt/.json).",
     )
 
     copy_images = st.checkbox(
@@ -515,11 +618,12 @@ with st.sidebar:
     )
 
     top_k = st.number_input("top_k", min_value=1, max_value=5000, value=450, step=1)
+    st.caption("top_k = number of highest-ranked entries saved and previewed.")
 
     st.subheader("Ranking weights")
-    distance_weight = st.number_input("distance_weight", value=1.0, step=0.1, format="%.3f")
-    lbp_weight = st.number_input("lbp_weight", value=1.0, step=0.1, format="%.3f")
-    segmentation_weight = st.number_input("segmentation_weight", value=1.0, step=0.1, format="%.3f")
+    distance_weight = st.number_input("distance_weight", value=1.0, step=0.1, format="%.3f", help="Weight for distance-based anomaly score.")
+    lbp_weight = st.number_input("lbp_weight", value=1.0, step=0.1, format="%.3f", help="Weight for LBP texture-based anomaly score.")
+    segmentation_weight = st.number_input("segmentation_weight", value=1.0, step=0.1, format="%.3f", help="Weight for segmentation-based score.")
 
     st.subheader("Distance")
     distance_model_name = st.selectbox(
@@ -541,11 +645,12 @@ with st.sidebar:
             "mlp",
         ],
         index=0,
+        help="Regression model used to estimate keypoint-distance error.",
     )
-    distance_sort_by = st.selectbox("distance_sort_by", options=["mean", "max"], index=0)
+    distance_sort_by = st.selectbox("distance_sort_by", options=["mean", "max"], index=0, help="How per-sample distance errors are aggregated.")
 
     st.subheader("Segmentation")
-    use_segmentation = st.checkbox("Enable segmentation", value=True)
+    use_segmentation = st.checkbox("Enable segmentation", value=True, help="If disabled, segmentation contribution is ignored.")
     segmentation_model_name = st.selectbox(
         "segmentation_model_name",
         options=[
@@ -561,6 +666,7 @@ with st.sidebar:
         ],
         index=2,
         disabled=not use_segmentation,
+        help="Segmentation model used to build mask-based validation signals.",
     )
     class_options = SEGMENTATION_CLASS_OPTIONS.get(segmentation_model_name, ["person"])
     default_class_index = class_options.index("person") if "person" in class_options else 0
@@ -569,6 +675,7 @@ with st.sidebar:
         options=class_options,
         index=default_class_index,
         disabled=not use_segmentation,
+        help="Target class that defines object masks for keypoint-inside/outside checks.",
     )
     segmentation_score_threshold = st.number_input(
         "segmentation_score_threshold",
@@ -576,6 +683,7 @@ with st.sidebar:
         step=0.05,
         format="%.2f",
         disabled=not use_segmentation,
+        help="Minimum confidence score for accepted segmentation masks.",
     )
     segmentation_mask_tolerance_px = st.number_input(
         "segmentation_mask_tolerance_px",
@@ -584,6 +692,7 @@ with st.sidebar:
         value=12,
         step=1,
         disabled=not use_segmentation,
+        help="Allowed pixel margin when testing whether a keypoint is outside a mask.",
     )
 
     run_button = st.button("Run ranking", type="primary")
