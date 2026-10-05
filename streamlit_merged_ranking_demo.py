@@ -516,12 +516,17 @@ with st.sidebar:
     st.caption("Dataset source")
     dataset_source_mode = st.radio(
         "How do you want to provide input data?",
-        options=["Path or URL", "Pick local folder on server", "Upload ZIP"],
+        options=["Path or URL", "Pick folder on app server", "Upload ZIP from your computer"],
         index=0,
         help=(
-            "Path or URL: manual path/URL. Pick local folder on server: choose a folder visible to this app. "
-            "Upload ZIP: upload a dataset archive from your computer."
+            "Path or URL: manual path/URL. Pick folder on app server: choose a folder visible to the running app process. "
+            "Upload ZIP from your computer: upload a dataset archive directly from your local machine."
         ),
+    )
+
+    st.info(
+        "In browser deployments (for example Streamlit Cloud), apps cannot directly browse your local disk folders. "
+        "Use 'Upload ZIP from your computer' or run the app locally to use direct folder paths."
     )
 
     dataset_source = ""
@@ -535,7 +540,7 @@ with st.sidebar:
             ),
         )
 
-    elif dataset_source_mode == "Pick local folder on server":
+    elif dataset_source_mode == "Pick folder on app server":
         default_scan_root = str(APP_DIR)
         scan_root_input = st.text_input(
             "Scan root directory",
@@ -580,6 +585,15 @@ with st.sidebar:
             "- A **YOLO file** such as `train.txt`, `data.yaml`, or `dataset.yaml`.\n"
             "- A **COCO JSON file** or directory (when `Input dataset format` is `coco_keypoints`).\n"
             "- A **remote URL** to `.zip`, `.yaml`, `.yml`, `.txt`, or `.json`."
+        )
+
+    with st.expander("Why can't I pick a local folder in Streamlit Cloud?", expanded=False):
+        st.markdown(
+            "Browser-based apps do not get direct access to your local filesystem paths for security reasons.\n"
+            "Use one of these options:\n"
+            "- Upload a ZIP archive from your computer.\n"
+            "- Host data on a URL and paste the link.\n"
+            "- Run the app locally and use direct paths/folder selection."
         )
 
     format_options = FORMAT_REGISTRY.list_formats()
