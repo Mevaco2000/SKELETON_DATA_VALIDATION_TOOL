@@ -4,7 +4,7 @@ import os
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 from urllib.parse import urlparse
 from urllib.request import urlretrieve
 
@@ -18,7 +18,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from utils import MergedRankingEvaluator, YOLOPoseDataset, YPSetValidation
+from utils.validation.merged_ranking_evaluator import MergedRankingEvaluator
+from utils.datasets.yolo_pose_dataset import YOLOPoseDataset
 from utils.datasets import FORMAT_REGISTRY, KeypointDatasetAdapter
 
 
@@ -218,7 +219,7 @@ def _sample_key(image_path: str, person_id: int) -> Tuple[str, int]:
     return os.path.normcase(str(image_path)), int(person_id)
 
 
-def _build_dataset_lookup(validator: YPSetValidation) -> Dict[Tuple[str, int], Dict[str, np.ndarray]]:
+def _build_dataset_lookup(validator: Any) -> Dict[Tuple[str, int], Dict[str, np.ndarray]]:
     lookup: Dict[Tuple[str, int], Dict[str, np.ndarray]] = {}
     for sample in validator.dataset:
         image = sample.get("image")
@@ -327,7 +328,10 @@ def run_ranking(
     distance_model_name: str,
     distance_sort_by: str,
     progress_callback=None,
-) -> Tuple[Dict, MergedRankingEvaluator, YPSetValidation, Optional[KeypointDatasetAdapter], Path]:
+) -> Tuple[Dict, MergedRankingEvaluator, Any, Optional[KeypointDatasetAdapter], Path]:
+    # Import heavy validation stack lazily to keep Streamlit startup light.
+    from utils.validation.set_validation import YPSetValidation
+
     def _emit(progress_value: int, message: str) -> None:
         if progress_callback is not None:
             progress_callback(int(progress_value), str(message))
