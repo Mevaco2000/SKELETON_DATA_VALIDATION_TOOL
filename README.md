@@ -27,7 +27,6 @@ Clone and install (Windows PowerShell):
 ```powershell
 git clone https://github.com/Mevaco2000/YOLO_POSE_Data_Validation.git
 cd YOLO_POSE_Data_Validation
-
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
@@ -39,10 +38,6 @@ If you downloaded a ZIP instead of cloning, extract it and run the same commands
 
 Notes:
 
-- Conda environments are also supported.
-- If you need a specific PyTorch build (for a CUDA version), install that `torch` build first, then run `pip install -r requirements.txt`.
-
-## 3. Post-install check
 
 Run smoke tests:
 
@@ -89,8 +84,6 @@ Registered formats include:
 - `yolo_pose`
 - `coco_keypoints`
 
-Example using the adapter:
-
 ```python
 from utils.datasets import KeypointDatasetAdapter
 
@@ -119,33 +112,42 @@ In the sidebar, configure:
 
 - `Input dataset format` (for example `yolo_pose` or `coco_keypoints`),
 - `Dataset path or URL` (directory/file/URL: `.zip`, `.yaml`, `.yml`, `.txt`, `.json`),
-- optional COCO conversion settings,
-- ranking weights and model options.
-
-For non-YOLO formats, the app converts the dataset internally to YOLO Pose before ranking.
 
 Results are written to:
 
 - `streamlit_outputs/run_YYYYMMDD_HHMMSS/`
 
-Including:
 
 - `combined_ranking.csv`
 - `top_k_ranked_paths.txt`
-- `annotated_top_k/`
-- `annotated_manifest.csv`
-
-### Streamlit Cloud deployment notes
 
 This repository includes two deployment helper files:
 
 - `runtime.txt` (pins Python to 3.11)
 - `packages.txt` (installs Linux system libs required by OpenCV)
-- `.streamlit/config.toml` (raises Streamlit upload/message limits for larger ZIP datasets)
-
-If you deploy on Streamlit Cloud and see an error like `ImportError: libGL.so.1`, redeploy after making sure these files are in the repository root.
 
 If your dataset ZIP is large (for example ~150 MB or more), make sure `.streamlit/config.toml` is present in the repository root and redeploy so Streamlit applies:
 
 - `server.maxUploadSize = 1024`
 - `server.maxMessageSize = 1024`
+
+Run the full app stack with Docker Compose:
+
+```powershell
+docker compose up --build
+```
+
+Then open:
+
+- `http://localhost:8501`
+
+Stop the app:
+
+```powershell
+docker compose down
+```
+
+Notes:
+
+- `streamlit_outputs/` is mounted as a volume, so generated outputs persist outside the container.
+- `.streamlit/config.toml` is mounted too, so upload limits stay configurable from the repo.
