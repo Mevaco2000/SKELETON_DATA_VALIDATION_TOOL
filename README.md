@@ -25,8 +25,8 @@ Core modules are under `utils/`:
 Clone and install (Windows PowerShell):
 
 ```powershell
-git clone https://github.com/Mevaco2000/YOLO_POSE_Data_Validation.git
-cd YOLO_POSE_Data_Validation
+git clone https://github.com/Mevaco2000/SKELETON_DATA_VALIDATION_TOOL.git
+cd SKELETON_DATA_VALIDATION_TOOL
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
